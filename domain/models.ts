@@ -873,3 +873,13 @@ export interface ManagedSource {
   lastSyncedAt: number;
   lastFileHash?: string;
 }
+
+// Generic Credential - for storing simple label + username + password credentials
+export interface GenericCredential {
+  id: string;
+  label: string;
+  username: string;
+  password: string; // Will be encrypted via safeStorage
+  createdAt: number;
+  updatedAt: number;
+}

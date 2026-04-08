@@ -120,6 +120,12 @@ export const STORAGE_KEY_SIDE_PANEL_WIDTH = 'netcatty_side_panel_width';
 // Port Forwarding (transient cross-window broadcast key)
 export const STORAGE_KEY_PF_RECONNECT_CANCEL = '__netcatty_pf_cancel_reconnect';
 
+// Database Connections
+export const STORAGE_KEY_DATABASE_CONFIGS = 'netcatty_database_configs_v1';
+
+// Generic Credentials
+export const STORAGE_KEY_GENERIC_CREDENTIALS = 'netcatty_generic_credentials_v1';
+
 // Debug Flags (no _v1 suffix — developer-only, not persisted data)
 export const STORAGE_KEY_DEBUG_HOTKEYS = 'debug.hotkeys';
 export const STORAGE_KEY_DEBUG_UPDATE_DEMO = 'debug.updateDemo';
