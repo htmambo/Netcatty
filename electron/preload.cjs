@@ -21,6 +21,8 @@ const updateDownloadedListeners = new Set();
 const updateAvailableListeners = new Set();
 const updateNotAvailableListeners = new Set();
 const updateErrorListeners = new Set();
+const dbStatusChangeListeners = new Set();
+const dbErrorListeners = new Set();
 
 function cleanupTransferListeners(transferId) {
   transferProgressListeners.delete(transferId);
@@ -325,6 +327,28 @@ ipcRenderer.on("netcatty:update:error", (_event, payload) => {
       cb(payload);
     } catch (err) {
       console.error("Update error callback failed", err);
+    }
+  });
+});
+
+// Database connection status change events
+ipcRenderer.on("netcatty:db:statusChange", (_event, payload) => {
+  dbStatusChangeListeners.forEach((cb) => {
+    try {
+      cb(payload);
+    } catch (err) {
+      console.error("Database status change callback failed", err);
+    }
+  });
+});
+
+// Database error events
+ipcRenderer.on("netcatty:db:error", (_event, payload) => {
+  dbErrorListeners.forEach((cb) => {
+    try {
+      cb(payload);
+    } catch (err) {
+      console.error("Database error callback failed", err);
     }
   });
 });
@@ -1311,6 +1335,88 @@ const api = {
     };
     ipcRenderer.on("netcatty:ai:agent:exit", handler);
     return () => ipcRenderer.removeListener("netcatty:ai:agent:exit", handler);
+  },
+
+  // ── Database IPC ──
+  // Helper to map domain field names to bridge field names
+  // Domain uses: username, authPassword, tls, tlsCert, tlsKey, tlsCa
+  // Bridge expects: user, password, ssl, sslCert, sslKey, sslCa
+  function mapConfigToBridge(config) {
+    if (!config) return config;
+    const mapped = { ...config };
+    // Map domain fields to bridge fields
+    if (mapped.username !== undefined) {
+      mapped.user = mapped.username;
+      delete mapped.username;
+    }
+    if (mapped.authPassword !== undefined) {
+      mapped.password = mapped.authPassword;
+      delete mapped.authPassword;
+    }
+    // tls -> ssl is a direct rename
+    if (mapped.tls !== undefined) {
+      mapped.ssl = mapped.tls;
+      delete mapped.tls;
+    }
+    // tlsCert/tlsKey/tlsCa -> sslCert/sslKey/sslCa
+    if (mapped.tlsCert !== undefined) {
+      mapped.sslCert = mapped.tlsCert;
+      delete mapped.tlsCert;
+    }
+    if (mapped.tlsKey !== undefined) {
+      mapped.sslKey = mapped.tlsKey;
+      delete mapped.tlsKey;
+    }
+    if (mapped.tlsCa !== undefined) {
+      mapped.sslCa = mapped.tlsCa;
+      delete mapped.tlsCa;
+    }
+    if (mapped.tlsRejectUnauthorized !== undefined) {
+      mapped.sslRejectUnauthorized = mapped.tlsRejectUnauthorized;
+      delete mapped.tlsRejectUnauthorized;
+    }
+    return mapped;
+  }
+
+  db: {
+    // Connection Management
+    listConfigs: () => ipcRenderer.invoke("netcatty:db:listConfigs"),
+    testConnection: (config) => {
+      const mappedConfig = mapConfigToBridge(config);
+      return ipcRenderer.invoke("netcatty:db:testConnection", { driver: mappedConfig.driver, config: mappedConfig });
+    },
+    saveConfig: (config) => {
+      const mappedConfig = mapConfigToBridge(config);
+      return ipcRenderer.invoke("netcatty:db:saveConfig", { config: mappedConfig });
+    },
+    deleteConfig: (configId) => ipcRenderer.invoke("netcatty:db:deleteConfig", { id: configId }),
+    connect: (configId) => ipcRenderer.invoke("netcatty:db:connect", { id: configId }),
+    disconnect: (sessionId) => ipcRenderer.invoke("netcatty:db:disconnect", { sessionId }),
+    getStatus: (sessionId) => ipcRenderer.invoke("netcatty:db:getStatus", { sessionId }),
+
+    // Query Execution
+    execute: (sessionId, query, params) => ipcRenderer.invoke("netcatty:db:execute", { sessionId, query, params }),
+
+    // Schema
+    getSchema: (sessionId) => ipcRenderer.invoke("netcatty:db:getSchema", { sessionId }),
+    listObjects: (sessionId, type) => ipcRenderer.invoke("netcatty:db:listObjects", { sessionId, type }),
+
+    // Event listeners for connection status changes
+    onStatusChange: (cb) => {
+      dbStatusChangeListeners.add(cb);
+      return () => dbStatusChangeListeners.delete(cb);
+    },
+    onError: (cb) => {
+      dbErrorListeners.add(cb);
+      return () => dbErrorListeners.delete(cb);
+    },
+  },
+
+  // ── Generic Credentials IPC ──
+  genericCredentials: {
+    list: () => ipcRenderer.invoke("netcatty:genericCredentials:list"),
+    save: (credential) => ipcRenderer.invoke("netcatty:genericCredentials:save", credential),
+    delete: (id) => ipcRenderer.invoke("netcatty:genericCredentials:delete", id),
   },
 };
 

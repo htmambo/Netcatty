@@ -160,8 +160,10 @@ const getSessionLogsBridge = createLazyModule("./bridges/sessionLogsBridge.cjs")
 const getCompressUploadBridge = createLazyModule("./bridges/compressUploadBridge.cjs");
 const getGlobalShortcutBridge = createLazyModule("./bridges/globalShortcutBridge.cjs");
 const getCredentialBridge = createLazyModule("./bridges/credentialBridge.cjs");
+const getGenericCredentialBridge = createLazyModule("./bridges/genericCredentialBridge.cjs");
 const getAutoUpdateBridge = createLazyModule("./bridges/autoUpdateBridge.cjs");
 const getAiBridge = createLazyModule("./bridges/aiBridge.cjs");
+const getDatabaseBridge = createLazyModule("./bridges/databaseBridge.cjs");
 const getWindowManager = createLazyModule("./bridges/windowManager.cjs");
 
 // GPU settings
@@ -407,6 +409,7 @@ const registerBridges = (win) => {
   const credentialBridge = getCredentialBridge();
   const autoUpdateBridge = getAutoUpdateBridge();
   const aiBridge = getAiBridge();
+  const databaseBridge = getDatabaseBridge();
 
   const getCloudSyncPasswordPath = () => {
     try {
@@ -500,10 +503,14 @@ const registerBridges = (win) => {
   compressUploadBridge.registerHandlers(ipcMain);
   globalShortcutBridge.registerHandlers(ipcMain);
   credentialBridge.registerHandlers(ipcMain, electronModule);
+  getGenericCredentialBridge().init({ electronModule });
+  getGenericCredentialBridge().registerHandlers(ipcMain);
   autoUpdateBridge.init(deps);
   autoUpdateBridge.registerHandlers(ipcMain);
   aiBridge.registerHandlers(ipcMain);
   crashLogBridge.registerHandlers(ipcMain);
+  databaseBridge.init({ ...deps, dbSessions: new Map() });
+  databaseBridge.registerHandlers(ipcMain);
 
   // ZMODEM cancel handler
   ipcMain.on("netcatty:zmodem:cancel", (_event, payload) => {
@@ -1119,6 +1126,11 @@ if (!gotLock) {
       getAiBridge().cleanup();
     } catch (err) {
       console.warn("Error during AI bridge cleanup:", err);
+    }
+    try {
+      getDatabaseBridge().closeAllConnections();
+    } catch (err) {
+      console.warn("Error during database bridge cleanup:", err);
     }
   });
 }
