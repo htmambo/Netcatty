@@ -26,6 +26,7 @@ module.exports = {
     ],
     asarUnpack: [
         'node_modules/node-pty/**/*',
+        'node_modules/better-sqlite3/**/*',
         'node_modules/ssh2/**/*',
         'node_modules/cpu-features/**/*',
         'node_modules/@zed-industries/claude-agent-acp/**/*',

@@ -175,6 +175,11 @@ function App({ settings }: { settings: SettingsState }) {
   const [keyboardInteractiveQueue, setKeyboardInteractiveQueue] = useState<KeyboardInteractiveRequest[]>([]);
   // Passphrase request queue for encrypted SSH keys
   const [passphraseQueue, setPassphraseQueue] = useState<PassphraseRequest[]>([]);
+  // Database sessions for TopTabs routing
+  const [databaseSessions, setDatabaseSessions] = useState<import('./domain/databaseModels').DatabaseSession[]>([]);
+  const handleCloseDatabaseSession = useCallback((sessionId: string) => {
+    setDatabaseSessions(prev => prev.filter(s => s.id !== sessionId));
+  }, []);
 
   const {
     setTheme,
@@ -1400,6 +1405,8 @@ function App({ settings }: { settings: SettingsState }) {
         onStartSessionDrag={setDraggingSessionId}
         onEndSessionDrag={handleEndSessionDrag}
         onReorderTabs={reorderTabs}
+        databaseSessions={databaseSessions}
+        onCloseDatabaseSession={handleCloseDatabaseSession}
       />
 
       <div className="flex-1 relative min-h-0">

@@ -1,4 +1,4 @@
-import { Bell, Copy, FileText, Folder, FolderLock, LayoutGrid, Minus, Moon, MoreHorizontal, Plus, Server, Sparkles, Square, Sun, TerminalSquare, Usb, X } from 'lucide-react';
+import { Bell, Copy, Database, FileText, Folder, FolderLock, LayoutGrid, Minus, Moon, MoreHorizontal, Plus, Server, Sparkles, Square, Sun, TerminalSquare, Usb, X } from 'lucide-react';
 import React, { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { activeTabStore, useActiveTabId } from '../application/state/activeTabStore';
 import { buildWorkspaceActivityMap } from '../application/state/sessionActivity';
@@ -9,6 +9,7 @@ import { useI18n } from '../application/i18n/I18nProvider';
 import { getEffectiveHostDistro } from '../domain/host';
 import { cn } from '../lib/utils';
 import { Host, TerminalSession, Workspace } from '../types';
+import type { DatabaseSession } from '../domain/databaseModels';
 import { DISTRO_LOGOS, DISTRO_COLORS } from './DistroAvatar';
 import { getShellIconPath, isMonochromeShellIcon } from '../lib/useDiscoveredShells';
 import { Button } from './ui/button';
@@ -43,6 +44,9 @@ interface TopTabsProps {
   onStartSessionDrag: (sessionId: string) => void;
   onEndSessionDrag: () => void;
   onReorderTabs: (draggedId: string, targetId: string, position: 'before' | 'after') => void;
+  // Database sessions
+  databaseSessions?: DatabaseSession[];
+  onCloseDatabaseSession?: (sessionId: string) => void;
 }
 
 // Detect local OS for local terminal tab icons
@@ -152,6 +156,22 @@ const sessionStatusDot = (status: TerminalSession['status'], hasActivity: boolea
   );
 };
 
+const databaseStatusDot = (connected: boolean, hasError?: string) => {
+  const tone = connected ? "bg-emerald-400" : hasError ? "bg-rose-500" : "bg-amber-400";
+  return (
+    <span className="relative inline-flex h-2 w-2 shrink-0 items-center justify-center">
+      <span
+        className={cn(
+          "relative inline-block h-2 w-2 rounded-full ring-2",
+          tone,
+          connected && "animate-pulse",
+        )}
+        style={{ boxShadow: '0 0 0 2px color-mix(in srgb, var(--top-tabs-active-bg, hsl(var(--background))) 60%, transparent)' }}
+      />
+    </span>
+  );
+};
+
 // Custom window controls for Windows/Linux (frameless window)
 const WindowControls: React.FC = memo(() => {
   const { minimize, maximize, close, isMaximized: fetchIsMaximized } = useWindowControls();
@@ -249,6 +269,8 @@ const TopTabsInner: React.FC<TopTabsProps> = ({
   onStartSessionDrag,
   onEndSessionDrag,
   onReorderTabs,
+  databaseSessions = [],
+  onCloseDatabaseSession,
 }) => {
   const { t } = useI18n();
   // Subscribe to activeTabId from external store
@@ -480,7 +502,8 @@ const TopTabsInner: React.FC<TopTabsProps> = ({
 
   // Render the tabs
   const renderOrderedTabs = () => {
-    return orderedTabItems.map((item) => {
+    // Map over ordered items
+    const orderedTabs = orderedTabItems.map((item) => {
       if (!item) return null;
 
       if (item.type === 'session') {
@@ -751,6 +774,73 @@ const TopTabsInner: React.FC<TopTabsProps> = ({
 
       return null;
     });
+
+    // Add database session tabs
+    const databaseTabs = databaseSessions.map((dbSession) => {
+      const isActive = activeTabId === `database:${dbSession.id}`;
+      const isConnected = dbSession.status.connected;
+      const hasError = !!dbSession.status.error;
+
+      return (
+        <div
+          key={dbSession.id}
+          data-tab-id={`database:${dbSession.id}`}
+          onClick={() => onSelectTab(`database:${dbSession.id}`)}
+          className={cn(
+            "relative h-7 pl-3 pr-2 min-w-[140px] max-w-[240px] rounded-none text-xs font-semibold cursor-pointer flex items-center justify-between gap-2 app-no-drag flex-shrink-0",
+          )}
+          style={{
+            backgroundColor: isActive
+              ? 'var(--top-tabs-active-bg, hsl(var(--background)))'
+              : 'transparent',
+            color: isActive
+              ? 'var(--top-tabs-fg, hsl(var(--foreground)))'
+              : 'var(--top-tabs-muted, hsl(var(--muted-foreground)))',
+          }}
+          onMouseEnter={(e) => {
+            if (!isActive) {
+              e.currentTarget.style.backgroundColor = 'color-mix(in srgb, var(--top-tabs-active-bg, hsl(var(--background))) 40%, transparent)';
+              e.currentTarget.style.color = 'var(--top-tabs-fg, hsl(var(--foreground)))';
+            }
+          }}
+          onMouseLeave={(e) => {
+            if (!isActive) {
+              e.currentTarget.style.backgroundColor = 'transparent';
+              e.currentTarget.style.color = 'var(--top-tabs-muted, hsl(var(--muted-foreground)))';
+            }
+          }}
+        >
+          {/* Active tab top accent line */}
+          {isActive && (
+            <div
+              className="absolute top-0 left-0 right-0 h-[2px]"
+              style={{ backgroundColor: 'var(--top-tabs-accent, hsl(var(--accent)))' }}
+            />
+          )}
+          <div className="flex items-center gap-2 min-w-0 flex-1">
+            <Database
+              size={14}
+              className="shrink-0"
+              style={{ color: isActive ? 'var(--top-tabs-accent, hsl(var(--accent)))' : 'var(--top-tabs-muted, hsl(var(--muted-foreground)))' }}
+            />
+            <span className="truncate">{dbSession.label}</span>
+            {databaseStatusDot(isConnected, hasError)}
+          </div>
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              onCloseDatabaseSession?.(dbSession.id);
+            }}
+            className="p-1 rounded-full hover:bg-destructive/10 hover:text-destructive transition-colors"
+            aria-label={t('tabs.closeDatabaseSessionAria')}
+          >
+            <X size={12} />
+          </button>
+        </div>
+      );
+    });
+
+    return [...orderedTabs, ...databaseTabs];
   };
 
   // Handle double-click on titlebar to maximize/restore window (Windows/Linux)
@@ -964,7 +1054,8 @@ const topTabsAreEqual = (prev: TopTabsProps, next: TopTabsProps): boolean => {
     prev.isMacClient === next.isMacClient &&
     prev.onOpenSettings === next.onOpenSettings &&
     prev.onSyncNow === next.onSyncNow &&
-    prev.isImmersiveActive === next.isImmersiveActive
+    prev.isImmersiveActive === next.isImmersiveActive &&
+    prev.databaseSessions === next.databaseSessions
   );
 };
 

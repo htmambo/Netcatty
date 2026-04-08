@@ -9,7 +9,7 @@
  * function degrades to a no-op — values pass through unmodified.
  */
 
-import type { GroupConfig, Host, Identity, SSHKey } from "../../domain/models";
+import type { GenericCredential, GroupConfig, Host, Identity, SSHKey } from "../../domain/models";
 import type { ProviderConnection, S3Config, WebDAVConfig } from "../../domain/sync";
 import { netcattyBridge } from "../services/netcattyBridge";
 
@@ -89,6 +89,30 @@ export async function decryptIdentitySecrets(identity: Identity): Promise<Identi
   const out = { ...identity };
   out.password = await decryptField(out.password);
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// Generic Credential
+// ---------------------------------------------------------------------------
+
+export async function encryptGenericCredential(cred: GenericCredential): Promise<GenericCredential> {
+  const out = { ...cred };
+  out.password = await encryptField(out.password);
+  return out;
+}
+
+export async function decryptGenericCredential(cred: GenericCredential): Promise<GenericCredential> {
+  const out = { ...cred };
+  out.password = await decryptField(out.password);
+  return out;
+}
+
+export function encryptGenericCredentials(creds: GenericCredential[]): Promise<GenericCredential[]> {
+  return Promise.all(creds.map(encryptGenericCredential));
+}
+
+export function decryptGenericCredentials(creds: GenericCredential[]): Promise<GenericCredential[]> {
+  return Promise.all(creds.map(decryptGenericCredential));
 }
 
 // ---------------------------------------------------------------------------

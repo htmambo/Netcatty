@@ -6,6 +6,7 @@ import {
   ClipboardCopy,
   Clock,
   Copy,
+  Database,
   Download,
   Edit2,
   FileCode,
@@ -44,6 +45,7 @@ import { cn } from "../lib/utils";
 import { useInstantThemeSwitch } from "../lib/useInstantThemeSwitch";
 import {
   ConnectionLog,
+  GenericCredential,
   GroupConfig,
   GroupNode,
   Host,
@@ -95,11 +97,13 @@ import { toast } from "./ui/toast";
 import { Tooltip, TooltipContent, TooltipTrigger, TooltipProvider } from "./ui/tooltip";
 import { Badge } from "./ui/badge";
 import { HotkeyScheme, KeyBinding } from "../domain/models";
+import type { DatabaseConfig, DatabaseSession } from "../domain/databaseModels";
+import { DatabaseView } from "./database";
 
 const LazyProtocolSelectDialog = lazy(() => import("./ProtocolSelectDialog"));
 const LazyConnectionLogsManager = lazy(() => import("./ConnectionLogsManager"));
 
-export type VaultSection = "hosts" | "keys" | "snippets" | "port" | "knownhosts" | "logs";
+export type VaultSection = "hosts" | "keys" | "snippets" | "port" | "knownhosts" | "logs" | "databases" | "credentials";
 
 type DropTarget =
   | { kind: "root" }
@@ -217,6 +221,13 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
   const [isDeleteGroupOpen, setIsDeleteGroupOpen] = useState(false);
   const [deleteTargetPath, setDeleteTargetPath] = useState<string | null>(null);
   const [deleteGroupWithHosts, setDeleteGroupWithHosts] = useState(false);
+
+  // Database state (local for MVP)
+  const [databaseConfigs, setDatabaseConfigs] = useState<DatabaseConfig[]>([]);
+  const [databaseSessions, setDatabaseSessions] = useState<DatabaseSession[]>([]);
+
+  // Generic credentials state
+  const [credentials, setCredentials] = useState<GenericCredential[]>([]);
 
   useInstantThemeSwitch(rootRef);
 
@@ -406,6 +417,308 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
     },
     [hosts, onUpdateHosts],
   );
+
+  // Database state editing
+  const [_databaseEditingConfig, setDatabaseEditingConfig] = useState<DatabaseConfig | null>(null);
+
+  // Load database configs on mount
+  useEffect(() => {
+    const loadConfigs = async () => {
+      try {
+        const { netcattyBridge: bridgeModule } = await import("../infrastructure/services/netcattyBridge");
+        const bridge = bridgeModule.get();
+        if (!bridge?.db) return;
+        const result = await bridge.db.listConfigs();
+        if (result.ok) {
+          setDatabaseConfigs(result.configs || []);
+        }
+      } catch (err) {
+        console.error('Failed to load database configs:', err);
+      }
+    };
+    loadConfigs();
+  }, []);
+
+  // Subscribe to database status changes
+  useEffect(() => {
+    let unsubscribe: (() => void) | undefined;
+    const setupSubscription = async () => {
+      try {
+        const { netcattyBridge: bridgeModule } = await import("../infrastructure/services/netcattyBridge");
+        const bridge = bridgeModule.get();
+        if (!bridge?.db) return;
+        unsubscribe = bridge.db.onStatusChange((payload) => {
+          const { sessionId, connected, error, serverVersion } = payload;
+
+          if (connected) {
+            // Update existing session or create new one
+            setDatabaseSessions(prev => {
+              const existing = prev.find(s => s.id === sessionId);
+              if (existing) {
+                return prev.map(s =>
+                  s.id === sessionId
+                    ? {
+                        ...s,
+                        status: {
+                          ...s.status,
+                          connected: true,
+                          serverVersion,
+                          error: undefined,
+                        },
+                        lastActivity: Date.now(),
+                      }
+                    : s
+                );
+              }
+              // Find the config for this session
+              const config = databaseConfigs.find(c => c.id === sessionId);
+              if (config) {
+                return [...prev, {
+                  id: sessionId,
+                  configId: sessionId,
+                  driver: config.driver,
+                  label: config.label,
+                  status: {
+                    connected: true,
+                    sessionId,
+                    driver: config.driver,
+                    serverVersion,
+                  },
+                  createdAt: Date.now(),
+                  lastActivity: Date.now(),
+                }];
+              }
+              return prev;
+            });
+          } else {
+            // Mark as disconnected or remove
+            setDatabaseSessions(prev =>
+              prev.map(s =>
+                s.id === sessionId
+                  ? {
+                      ...s,
+                      status: {
+                        ...s.status,
+                        connected: false,
+                        error,
+                      },
+                    }
+                  : s
+              )
+            );
+          }
+        });
+      } catch (err) {
+        console.error('Failed to setup database status subscription:', err);
+      }
+    };
+    setupSubscription();
+    return () => {
+      if (unsubscribe) unsubscribe();
+    };
+  }, [databaseConfigs]);
+
+  // Database handlers
+  const handleDatabaseConnect = useCallback(async (configId: string) => {
+    const config = databaseConfigs.find(c => c.id === configId);
+    if (!config) {
+      toast.error('Configuration not found');
+      return;
+    }
+
+    try {
+      const { netcattyBridge: bridgeModule } = await import("../infrastructure/services/netcattyBridge");
+      const bridge = bridgeModule.get();
+      if (!bridge?.db) {
+        toast.error('Database bridge unavailable');
+        return;
+      }
+      const result = await bridge.db.connect(configId);
+      if (result.ok) {
+        // Session will be created via status change event
+        toast.success(`Connected to ${config.label}`);
+      } else {
+        toast.error(result.error || 'Failed to connect');
+      }
+    } catch (err) {
+      toast.error(`Connection failed: ${err}`);
+    }
+  }, [databaseConfigs]);
+
+  const handleDatabaseDisconnect = useCallback(async (sessionId: string) => {
+    try {
+      const { netcattyBridge: bridgeModule } = await import("../infrastructure/services/netcattyBridge");
+      const bridge = bridgeModule.get();
+      if (!bridge?.db) {
+        toast.error('Database bridge unavailable');
+        return;
+      }
+      const result = await bridge.db.disconnect(sessionId);
+      if (result.ok) {
+        setDatabaseSessions(prev => prev.filter(s => s.id !== sessionId));
+        toast.success('Disconnected');
+      } else {
+        toast.error(result.error || 'Failed to disconnect');
+      }
+    } catch (err) {
+      toast.error(`Disconnect failed: ${err}`);
+    }
+  }, []);
+
+  const handleDatabaseSaveConfig = useCallback(async (config: DatabaseConfig) => {
+    const newConfig = {
+      ...config,
+      id: config.id || crypto.randomUUID(),
+      createdAt: config.createdAt || Date.now(),
+      lastConnectedAt: Date.now(),
+    };
+
+    try {
+      const { netcattyBridge: bridgeModule } = await import("../infrastructure/services/netcattyBridge");
+      const bridge = bridgeModule.get();
+      if (!bridge?.db) {
+        toast.error('Database bridge unavailable');
+        return;
+      }
+      const result = await bridge.db.saveConfig(newConfig);
+      if (result.ok) {
+        // Update local state
+        setDatabaseConfigs(prev => {
+          const existingIndex = prev.findIndex(c => c.id === newConfig.id);
+          if (existingIndex >= 0) {
+            return prev.map(c => c.id === newConfig.id ? newConfig : c);
+          }
+          return [...prev, newConfig];
+        });
+        toast.success(newConfig.id ? 'Configuration updated' : 'Configuration saved');
+        setDatabaseEditingConfig(null);
+      } else {
+        toast.error(result.error || 'Failed to save configuration');
+      }
+    } catch (err) {
+      toast.error(`Save failed: ${err}`);
+    }
+  }, []);
+
+  const handleDatabaseDeleteConfig = useCallback(async (configId: string) => {
+    try {
+      const { netcattyBridge: bridgeModule } = await import("../infrastructure/services/netcattyBridge");
+      const bridge = bridgeModule.get();
+      if (!bridge?.db) {
+        toast.error('Database bridge unavailable');
+        return;
+      }
+      const result = await bridge.db.deleteConfig(configId);
+      if (result.ok) {
+        setDatabaseConfigs(prev => prev.filter(c => c.id !== configId));
+        // Also disconnect any active sessions for this config
+        setDatabaseSessions(prev => prev.filter(s => s.configId !== configId));
+        toast.success('Configuration deleted');
+      } else {
+        toast.error(result.error || 'Failed to delete configuration');
+      }
+    } catch (err) {
+      toast.error(`Delete failed: ${err}`);
+    }
+  }, []);
+
+  const handleDatabaseEditConfig = useCallback((config: DatabaseConfig) => {
+    setDatabaseEditingConfig(config.id ? config : { ...config, id: crypto.randomUUID() });
+  }, []);
+
+  const handleDatabaseTestConnection = useCallback(async (config: DatabaseConfig) => {
+    try {
+      const { netcattyBridge: bridgeModule } = await import("../infrastructure/services/netcattyBridge");
+      const bridge = bridgeModule.get();
+      if (!bridge?.db) {
+        toast.error('Database bridge unavailable');
+        return;
+      }
+      toast.info(`Testing connection to ${config.label}...`);
+      const result = await bridge.db.testConnection(config);
+      if (result.ok) {
+        toast.success(`Connection test successful for ${config.label}`);
+      } else {
+        toast.error(result.error || `Connection test failed for ${config.label}`);
+      }
+    } catch (err) {
+      toast.error(`Test failed: ${err}`);
+    }
+  }, []);
+
+  // Load credentials when section changes to credentials
+  useEffect(() => {
+    if (currentSection === "credentials") {
+      loadCredentialsFromBridge();
+    }
+  }, [currentSection, loadCredentialsFromBridge]);
+
+  const loadCredentialsFromBridge = useCallback(async () => {
+    try {
+      const { netcattyBridge: bridgeModule } = await import("../infrastructure/services/netcattyBridge");
+      const bridge = bridgeModule.get();
+      if (!bridge?.genericCredentials) {
+        toast.error('Generic credentials bridge unavailable');
+        return;
+      }
+      const result = await bridge.genericCredentials.list();
+      if (result.ok) {
+        setCredentials(result.credentials);
+      } else {
+        toast.error(result.error || "Failed to load credentials");
+      }
+    } catch (err) {
+      toast.error(`Failed to load credentials: ${err}`);
+    }
+  }, []);
+
+  const handleSaveCredential = useCallback(async (credential: GenericCredential) => {
+    try {
+      const { netcattyBridge: bridgeModule } = await import("../infrastructure/services/netcattyBridge");
+      const bridge = bridgeModule.get();
+      if (!bridge?.genericCredentials) {
+        toast.error('Generic credentials bridge unavailable');
+        return;
+      }
+      const result = await bridge.genericCredentials.save(credential);
+      if (result.ok) {
+        setCredentials(prev => {
+          const existingIndex = prev.findIndex(c => c.id === credential.id);
+          if (existingIndex >= 0) {
+            const updated = [...prev];
+            updated[existingIndex] = result.credential;
+            return updated;
+          }
+          return [...prev, result.credential];
+        });
+        toast.success(credential.id ? "Credential updated" : "Credential saved");
+      } else {
+        toast.error(result.error || "Failed to save credential");
+      }
+    } catch (err) {
+      toast.error(`Failed to save credential: ${err}`);
+    }
+  }, []);
+
+  const handleDeleteCredential = useCallback(async (id: string) => {
+    try {
+      const { netcattyBridge: bridgeModule } = await import("../infrastructure/services/netcattyBridge");
+      const bridge = bridgeModule.get();
+      if (!bridge?.genericCredentials) {
+        toast.error('Generic credentials bridge unavailable');
+        return;
+      }
+      const result = await bridge.genericCredentials.delete(id);
+      if (result.ok) {
+        setCredentials(prev => prev.filter(c => c.id !== id));
+        toast.success("Credential deleted");
+      } else {
+        toast.error(result.error || "Failed to delete credential");
+      }
+    } catch (err) {
+      toast.error(`Failed to delete credential: ${err}`);
+    }
+  }, []);
 
   const handleNewHost = useCallback(() => {
     setIsGroupPanelOpen(false);
@@ -1699,6 +2012,42 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
               </TooltipTrigger>
               {sidebarCollapsed && <TooltipContent side="right">{t("vault.nav.logs")}</TooltipContent>}
             </Tooltip>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant={currentSection === "databases" ? "secondary" : "ghost"}
+                  className={cn(
+                    "w-full h-10",
+                    sidebarCollapsed ? "justify-center p-0" : "justify-start gap-3",
+                    currentSection === "databases" &&
+                    "bg-foreground/10 text-foreground hover:bg-foreground/15 border-border/40",
+                  )}
+                  onClick={() => setCurrentSection("databases")}
+                >
+                  <Database size={16} className="flex-shrink-0" />
+                  {!sidebarCollapsed && t("vault.nav.databases")}
+                </Button>
+              </TooltipTrigger>
+              {sidebarCollapsed && <TooltipContent side="right">{t("vault.nav.databases")}</TooltipContent>}
+            </Tooltip>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant={currentSection === "credentials" ? "secondary" : "ghost"}
+                  className={cn(
+                    "w-full h-10",
+                    sidebarCollapsed ? "justify-center p-0" : "justify-start gap-3",
+                    currentSection === "credentials" &&
+                    "bg-foreground/10 text-foreground hover:bg-foreground/15 border-border/40",
+                  )}
+                  onClick={() => setCurrentSection("credentials")}
+                >
+                  <Key size={16} className="flex-shrink-0" />
+                  {!sidebarCollapsed && t("vault.nav.credentials")}
+                </Button>
+              </TooltipTrigger>
+              {sidebarCollapsed && <TooltipContent side="right">{t("vault.nav.credentials")}</TooltipContent>}
+            </Tooltip>
           </div>
 
           <div className={cn("mt-auto pb-4 space-y-2", sidebarCollapsed ? "px-1.5" : "px-3")}>
@@ -2859,6 +3208,27 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
               onOpenLogView={onOpenLogView}
             />
           </Suspense>
+        )}
+        {/* Database Section */}
+        {currentSection === "databases" && (
+          <DatabaseView
+            configs={databaseConfigs}
+            sessions={databaseSessions}
+            onConnect={handleDatabaseConnect}
+            onDisconnect={handleDatabaseDisconnect}
+            onSaveConfig={handleDatabaseSaveConfig}
+            onDeleteConfig={handleDatabaseDeleteConfig}
+            onEditConfig={handleDatabaseEditConfig}
+            onTestConnection={handleDatabaseTestConnection}
+          />
+        )}
+        {/* Credentials Section */}
+        {currentSection === "credentials" && (
+          <CredentialsView
+            credentials={credentials}
+            onSave={handleSaveCredential}
+            onDelete={handleDeleteCredential}
+          />
         )}
       </div>
 
