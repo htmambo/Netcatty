@@ -138,7 +138,10 @@ async function handleList(event) {
  * Password is encrypted before storage.
  */
 async function handleSave(event, payload) {
-  const { credential } = payload;
+  const credential =
+    payload && typeof payload === "object" && payload.credential
+      ? payload.credential
+      : payload;
 
   if (!credential || !credential.id) {
     return { ok: false, error: "Credential must include an 'id' field" };
@@ -185,7 +188,10 @@ async function handleSave(event, payload) {
  * Delete a generic credential by ID.
  */
 async function handleDelete(event, payload) {
-  const { id } = payload;
+  const id =
+    payload && typeof payload === "object" && "id" in payload
+      ? payload.id
+      : payload;
 
   if (!id) {
     return { ok: false, error: "Credential ID is required" };

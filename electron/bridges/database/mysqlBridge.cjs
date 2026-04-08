@@ -29,7 +29,6 @@ const {
  * @param {string} [config.sslCa] - CA certificate
  * @param {string} [config.sslCert] - Client certificate
  * @param {string} [config.sslKey] - Client key
- * @param {boolean} [config.allowPublicKeyRetrieval=false] - Allow public key retrieval
  * @param {boolean} [config.compress=false] - Use compression
  * @param {number} [config.connectionTimeout=10000] - Connection timeout in ms
  * @returns {Promise<{ok: boolean, version?: string, latencyMs?: number, error?: string}>}
@@ -52,8 +51,6 @@ async function testConnection(config) {
       password: config.password || "",
       database: config.database || undefined,
       connectTimeout: connectionTimeout,
-      // Security options
-      allowPublicKeyRetrieval: config.allowPublicKeyRetrieval !== false,
       // TLS/SSL configuration
       ssl: buildSslConfig(config),
       // Performance
@@ -122,8 +119,6 @@ async function createPool(config) {
       connectionLimit: config.connectionLimit || 10,
       queueLimit: config.queueLimit || 0,
       connectTimeout: connectionTimeout,
-      // Security options
-      allowPublicKeyRetrieval: config.allowPublicKeyRetrieval !== false,
       // TLS/SSL
       ssl: buildSslConfig(config),
       // Performance

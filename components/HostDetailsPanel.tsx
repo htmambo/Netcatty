@@ -31,6 +31,7 @@ import {
 import React, { useEffect, useMemo, useState, useCallback } from "react";
 import { useI18n } from "../application/i18n/I18nProvider";
 import { useApplicationBackend } from "../application/state/useApplicationBackend";
+import { useGenericCredentials } from "../application/state/useGenericCredentials";
 import { getEffectiveHostDistro, LINUX_DISTRO_OPTIONS } from "../domain/host";
 import { customThemeStore } from "../application/state/customThemeStore";
 import {
@@ -43,7 +44,7 @@ import {
 } from "../domain/terminalAppearance";
 import { MIN_FONT_SIZE, MAX_FONT_SIZE } from "../infrastructure/config/fonts";
 import { cn } from "../lib/utils";
-import { EnvVar, Host, Identity, ManagedSource, ProxyConfig, SSHKey } from "../types";
+import { EnvVar, GenericCredential, Host, Identity, ManagedSource, ProxyConfig, SSHKey } from "../types";
 import { DISTRO_COLORS, DISTRO_LOGOS } from "./DistroAvatar";
 import { DistroAvatar } from "./DistroAvatar";
 import ThemeSelectPanel from "./ThemeSelectPanel";
@@ -54,6 +55,7 @@ import {
   type AsidePanelLayout,
 } from "./ui/aside-panel";
 import { Badge } from "./ui/badge";
+import { Label } from "./ui/label";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "./ui/tooltip";
 import { Button } from "./ui/button";
 import { Switch } from "./ui/switch";
@@ -64,6 +66,8 @@ import { Textarea } from "./ui/textarea";
 import { Popover, PopoverContent, PopoverTrigger } from "./ui/popover";
 import { ScrollArea } from "./ui/scroll-area";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "./ui/select";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "./ui/dialog";
+import { toast } from "./ui/toast";
 
 // Import host-details sub-panels
 import {
@@ -157,6 +161,15 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
 
   // Password visibility state
   const [showPassword, setShowPassword] = useState(false);
+  const {
+    credentials: genericCredentials,
+    loadCredentials: loadGenericCredentials,
+    saveCredential,
+  } = useGenericCredentials();
+  const [selectedGenericCredentialId, setSelectedGenericCredentialId] = useState("__none__");
+  const [isSaveCredentialDialogOpen, setIsSaveCredentialDialogOpen] = useState(false);
+  const [credentialLabelDraft, setCredentialLabelDraft] = useState("");
+  const [isSavingGenericCredential, setIsSavingGenericCredential] = useState(false);
 
   // Local key file path input state
   const [newKeyFilePath, setNewKeyFilePath] = useState("");
@@ -197,8 +210,13 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
       setGroupInputValue(initialData.group || "");
       // Reset password visibility when host changes for privacy
       setShowPassword(false);
+      setSelectedGenericCredentialId("__none__");
     }
   }, [initialData]);
+
+  useEffect(() => {
+    void loadGenericCredentials();
+  }, [loadGenericCredentials]);
 
   const update = <K extends keyof Host>(key: K, value: Host[K]) => {
     setForm((prev) => ({ ...prev, [key]: value }));
@@ -481,6 +499,7 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
         identityFileId: undefined,
         identityFilePaths: undefined,
       }));
+      setSelectedGenericCredentialId("__none__");
       setSelectedCredentialType(null);
       setCredentialPopoverOpen(false);
       setIdentitySuggestionsOpen(false);
@@ -492,6 +511,91 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
     setForm((prev) => ({ ...prev, identityId: undefined }));
     setIdentitySuggestionsOpen(false);
   }, []);
+
+  const applyGenericCredential = useCallback((credentialId: string) => {
+    setSelectedGenericCredentialId(credentialId);
+    if (credentialId === "__none__") return;
+
+    const credential = genericCredentials.find((item) => item.id === credentialId);
+    if (!credential) return;
+
+    setForm((prev) => ({
+      ...prev,
+      username: credential.username || prev.username,
+      password: credential.password,
+      authMethod: "password",
+      identityId: undefined,
+      identityFileId: undefined,
+      identityFilePaths: undefined,
+      savePassword: true,
+    }));
+    setSelectedCredentialType(null);
+    setIdentitySuggestionsOpen(false);
+  }, [genericCredentials]);
+
+  const openSaveCredentialDialog = useCallback(() => {
+    setCredentialLabelDraft(
+      form.label?.trim() || form.hostname?.trim() || form.username?.trim() || "",
+    );
+    setIsSaveCredentialDialogOpen(true);
+  }, [form.hostname, form.label, form.username]);
+
+  const handleSaveCurrentAsGenericCredential = useCallback(async () => {
+    const password = form.password || "";
+    if (!password.trim()) {
+      toast.error(t("hostDetails.savedCredentials.passwordRequired"));
+      return;
+    }
+
+    const label =
+      credentialLabelDraft.trim() ||
+      form.label?.trim() ||
+      form.hostname?.trim() ||
+      form.username?.trim();
+
+    if (!label) {
+      toast.error(t("hostDetails.savedCredentials.labelRequired"));
+      return;
+    }
+
+    setIsSavingGenericCredential(true);
+    try {
+      const credential: GenericCredential = {
+        id: crypto.randomUUID(),
+        label,
+        username: form.username || "",
+        password,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      };
+
+      const result = await saveCredential(credential);
+      if (!result?.ok || !result?.credential) {
+        throw new Error(result?.error || t("hostDetails.savedCredentials.saveFailed"));
+      }
+
+      await loadGenericCredentials();
+      setSelectedGenericCredentialId(result.credential.id);
+      setCredentialLabelDraft("");
+      setIsSaveCredentialDialogOpen(false);
+      toast.success(t("hostDetails.savedCredentials.saved"));
+    } catch (err) {
+      toast.error(
+        err instanceof Error ? err.message : t("hostDetails.savedCredentials.saveFailed"),
+      );
+    } finally {
+      setIsSavingGenericCredential(false);
+    }
+  }, [
+    credentialLabelDraft,
+    form.hostname,
+    form.label,
+    form.password,
+    form.username,
+    t,
+    saveCredential,
+    loadGenericCredentials,
+  ]);
 
   // Render sub-panels
   if (activeSubPanel === "create-group") {
@@ -629,28 +733,29 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
 
   // Main panel
   return (
-    <AsidePanel
-      open={true}
-      onClose={onCancel}
-      width="w-[420px]"
-      layout={layout}
-      dataSection="host-details-panel"
-      title={
-        initialData ? t("hostDetails.title.details") : t("hostDetails.title.new")
-      }
-      actions={
-        <Button
-          variant="ghost"
-          size="icon"
-          className="h-8 w-8"
-          onClick={handleSubmit}
-          disabled={!form.hostname}
-          aria-label={t("hostDetails.saveAria")}
-        >
-          <Check size={16} />
-        </Button>
-      }
-    >
+    <>
+      <AsidePanel
+        open={true}
+        onClose={onCancel}
+        width="w-[420px]"
+        layout={layout}
+        dataSection="host-details-panel"
+        title={
+          initialData ? t("hostDetails.title.details") : t("hostDetails.title.new")
+        }
+        actions={
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-8 w-8"
+            onClick={handleSubmit}
+            disabled={!form.hostname}
+            aria-label={t("hostDetails.saveAria")}
+          >
+            <Check size={16} />
+          </Button>
+        }
+      >
       <AsidePanelContent>
         <Card className="p-3 space-y-3 bg-card border-border/80">
           <div className="flex items-center gap-2">
@@ -974,6 +1079,54 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
                 >
                   {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
                 </button>
+              </div>
+            )}
+
+            {!selectedIdentity && !form.identityId && (
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs text-muted-foreground">
+                    {t("hostDetails.savedCredentials.title")}
+                  </span>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 px-2 text-xs"
+                    onClick={openSaveCredentialDialog}
+                    disabled={!form.password}
+                  >
+                    <Plus size={12} className="mr-1.5" />
+                    {t("hostDetails.savedCredentials.saveCurrent")}
+                  </Button>
+                </div>
+                {genericCredentials.filter((c) => c.id).length > 0 ? (
+                  <Select
+                    value={selectedGenericCredentialId || "__none__"}
+                    onValueChange={applyGenericCredential}
+                  >
+                    <SelectTrigger className="h-10">
+                      <SelectValue
+                        placeholder={t("hostDetails.savedCredentials.selectPlaceholder")}
+                      />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="__none__">{t("common.none")}</SelectItem>
+                      {genericCredentials
+                        .filter((c) => c.id)
+                        .map((credential) => (
+                          <SelectItem key={credential.id} value={credential.id}>
+                            {credential.label}
+                            {credential.username ? ` (${credential.username})` : ""}
+                          </SelectItem>
+                        ))}
+                    </SelectContent>
+                  </Select>
+                ) : (
+                  <p className="text-xs text-muted-foreground">
+                    {t("hostDetails.savedCredentials.noneAvailable")}
+                  </p>
+                )}
               </div>
             )}
 
@@ -1913,16 +2066,86 @@ const HostDetailsPanel: React.FC<HostDetailsPanelProps> = ({
           </Button>
         )}
       </AsidePanelContent>
-      <AsidePanelFooter>
-        <Button
-          className="w-full h-10"
-          onClick={handleSubmit}
-          disabled={!form.hostname}
-        >
-          {t("common.save")}
-        </Button>
-      </AsidePanelFooter>
-    </AsidePanel>
+        <AsidePanelFooter>
+          <Button
+            className="w-full h-10"
+            onClick={handleSubmit}
+            disabled={!form.hostname}
+          >
+            {t("common.save")}
+          </Button>
+        </AsidePanelFooter>
+      </AsidePanel>
+
+      <Dialog
+        open={isSaveCredentialDialogOpen}
+        onOpenChange={(open) => {
+          setIsSaveCredentialDialogOpen(open);
+          if (!open) {
+            setCredentialLabelDraft("");
+          }
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{t("hostDetails.savedCredentials.saveDialogTitle")}</DialogTitle>
+            <DialogDescription>
+              {t("hostDetails.savedCredentials.saveDialogDesc")}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 py-2">
+            <div className="space-y-2">
+              <Label htmlFor="saved-credential-label">
+                {t("vault.credentials.label")}
+              </Label>
+              <Input
+                id="saved-credential-label"
+                value={credentialLabelDraft}
+                onChange={(e) => setCredentialLabelDraft(e.target.value)}
+                placeholder={t("vault.credentials.labelPlaceholder")}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="saved-credential-username">
+                {t("vault.credentials.username")}
+              </Label>
+              <Input
+                id="saved-credential-username"
+                value={form.username || ""}
+                readOnly
+              />
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="saved-credential-password">
+                {t("vault.credentials.password")}
+              </Label>
+              <Input
+                id="saved-credential-password"
+                value={form.password || ""}
+                type="password"
+                readOnly
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={() => setIsSaveCredentialDialogOpen(false)}
+            >
+              {t("common.cancel")}
+            </Button>
+            <Button
+              type="button"
+              onClick={() => void handleSaveCurrentAsGenericCredential()}
+              disabled={isSavingGenericCredential}
+            >
+              {t("common.save")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
   );
 };
 

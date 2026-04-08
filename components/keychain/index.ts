@@ -19,3 +19,6 @@ export { GenerateStandardPanel } from './GenerateStandardPanel';
 export { IdentityPanel } from './IdentityPanel';
 export { ImportKeyPanel } from './ImportKeyPanel';
 export { ViewKeyPanel } from './ViewKeyPanel';
+
+// Credentials view
+export { CredentialsView } from '../CredentialsView';

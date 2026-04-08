@@ -537,14 +537,14 @@ const DatabaseDetailsPanel: React.FC<DatabaseDetailsPanelProps> = ({
                 <div className="space-y-1.5">
                   <Label htmlFor="sshTunnel">{t("database.sshTunnelHost")}</Label>
                   <Select
-                    value={form.sshTunnelHostId || ""}
-                    onValueChange={(v) => update("sshTunnelHostId", v || undefined)}
+                    value={form.sshTunnelHostId || "__none__"}
+                    onValueChange={(v) => update("sshTunnelHostId", v === "__none__" ? undefined : v)}
                   >
                     <SelectTrigger id="sshTunnel" className="h-10">
                       <SelectValue placeholder={t("database.selectSshTunnel")} />
                     </SelectTrigger>
                     <SelectContent>
-                      <SelectItem value="">{t("common.none")}</SelectItem>
+                      <SelectItem value="__none__">{t("common.none")}</SelectItem>
                       {availableHosts.map((host) => (
                         <SelectItem key={host.id} value={host.id}>
                           {host.label}

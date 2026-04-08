@@ -80,7 +80,9 @@ async function loadConfigs() {
   try {
     if (fs.existsSync(configPath)) {
       const data = await fs.promises.readFile(configPath, "utf-8");
-      return JSON.parse(data);
+      const parsed = JSON.parse(data);
+      if (!Array.isArray(parsed)) return [];
+      return parsed.map(normalizeDatabaseConfig).filter(Boolean);
     }
   } catch (err) {
     console.warn("[DatabaseBridge] Failed to load configs:", err.message);
@@ -96,11 +98,123 @@ async function loadConfigs() {
 async function saveConfigs(configs) {
   const configPath = getConfigPath();
   try {
-    await fs.promises.writeFile(configPath, JSON.stringify(configs, null, 2), "utf-8");
+    const normalizedConfigs = Array.isArray(configs)
+      ? configs.map(normalizeDatabaseConfig).filter(Boolean)
+      : [];
+    await fs.promises.writeFile(configPath, JSON.stringify(normalizedConfigs, null, 2), "utf-8");
   } catch (err) {
     console.warn("[DatabaseBridge] Failed to save configs:", err.message);
     throw err;
   }
+}
+
+function normalizeDatabaseConfig(config) {
+  if (!config || typeof config !== "object" || Array.isArray(config)) {
+    return null;
+  }
+
+  const normalized = { ...config };
+
+  if (normalized.label === undefined && typeof normalized.name === "string") {
+    normalized.label = normalized.name;
+  }
+  if (normalized.username === undefined && typeof normalized.user === "string") {
+    normalized.username = normalized.user;
+  }
+  if (normalized.authPassword === undefined && typeof normalized.password === "string") {
+    normalized.authPassword = normalized.password;
+  }
+  if (normalized.tls === undefined && normalized.ssl !== undefined) {
+    normalized.tls = normalized.ssl;
+  }
+  if (normalized.tlsCa === undefined && normalized.sslCa !== undefined) {
+    normalized.tlsCa = normalized.sslCa;
+  }
+  if (normalized.tlsCert === undefined && normalized.sslCert !== undefined) {
+    normalized.tlsCert = normalized.sslCert;
+  }
+  if (normalized.tlsKey === undefined && normalized.sslKey !== undefined) {
+    normalized.tlsKey = normalized.sslKey;
+  }
+  if (
+    normalized.tlsRejectUnauthorized === undefined &&
+    normalized.sslRejectUnauthorized !== undefined
+  ) {
+    normalized.tlsRejectUnauthorized = normalized.sslRejectUnauthorized;
+  }
+  if (normalized.databaseIndex === undefined && normalized.db !== undefined) {
+    normalized.databaseIndex = normalized.db;
+  }
+  if (normalized.poolMax === undefined && normalized.connectionLimit !== undefined) {
+    normalized.poolMax = normalized.connectionLimit;
+  }
+  if (normalized.poolIdleTimeoutMs === undefined && normalized.idleTimeout !== undefined) {
+    normalized.poolIdleTimeoutMs = normalized.idleTimeout;
+  }
+
+  delete normalized.name;
+  delete normalized.user;
+  delete normalized.password;
+  delete normalized.ssl;
+  delete normalized.sslCa;
+  delete normalized.sslCert;
+  delete normalized.sslKey;
+  delete normalized.sslRejectUnauthorized;
+  delete normalized.db;
+  delete normalized.connectionLimit;
+  delete normalized.idleTimeout;
+  delete normalized.hasPassword;
+
+  return normalized;
+}
+
+function toDriverConfig(config) {
+  const driverConfig = { ...config };
+
+  if (driverConfig.username !== undefined && driverConfig.user === undefined) {
+    driverConfig.user = driverConfig.username;
+  }
+  if (driverConfig.authPassword !== undefined && driverConfig.password === undefined) {
+    driverConfig.password = driverConfig.authPassword;
+  }
+
+  if (driverConfig.driver === "mysql") {
+    if (driverConfig.tls !== undefined && driverConfig.ssl === undefined) {
+      driverConfig.ssl = driverConfig.tls;
+    }
+    if (driverConfig.tlsCa !== undefined && driverConfig.sslCa === undefined) {
+      driverConfig.sslCa = driverConfig.tlsCa;
+    }
+    if (driverConfig.tlsCert !== undefined && driverConfig.sslCert === undefined) {
+      driverConfig.sslCert = driverConfig.tlsCert;
+    }
+    if (driverConfig.tlsKey !== undefined && driverConfig.sslKey === undefined) {
+      driverConfig.sslKey = driverConfig.tlsKey;
+    }
+    if (
+      driverConfig.tlsRejectUnauthorized !== undefined &&
+      driverConfig.sslRejectUnauthorized === undefined
+    ) {
+      driverConfig.sslRejectUnauthorized = driverConfig.tlsRejectUnauthorized;
+    }
+    if (driverConfig.poolMax !== undefined && driverConfig.connectionLimit === undefined) {
+      driverConfig.connectionLimit = driverConfig.poolMax;
+    }
+    if (
+      driverConfig.poolIdleTimeoutMs !== undefined &&
+      driverConfig.idleTimeout === undefined
+    ) {
+      driverConfig.idleTimeout = driverConfig.poolIdleTimeoutMs;
+    }
+  }
+
+  if (driverConfig.driver === "redis") {
+    if (driverConfig.databaseIndex !== undefined && driverConfig.db === undefined) {
+      driverConfig.db = driverConfig.databaseIndex;
+    }
+  }
+
+  return driverConfig;
 }
 
 // ─────────────────────────────────────────────
@@ -112,18 +226,19 @@ async function saveConfigs(configs) {
  * POST body: { driver: 'mysql'|'redis', config: {...} }
  */
 async function handleTestConnection(event, payload) {
-  const { driver, config } = payload;
+  const config = normalizeDatabaseConfig(payload?.config);
+  const driver = payload?.driver || config?.driver;
 
   if (driver === "mysql") {
     const bridge = getSubBridge("mysql");
     if (!bridge) return { ok: false, error: "MySQL driver not available (mysql2 not installed)" };
-    return bridge.testConnection(config);
+    return bridge.testConnection(toDriverConfig(config));
   }
 
   if (driver === "redis") {
     const bridge = getSubBridge("redis");
     if (!bridge) return { ok: false, error: "Redis driver not available (ioredis not installed)" };
-    return bridge.testConnection(config);
+    return bridge.testConnection(toDriverConfig(config));
   }
 
   return { ok: false, error: `Unknown driver: ${driver}` };
@@ -134,7 +249,7 @@ async function handleTestConnection(event, payload) {
  * POST body: { config: {...} } - config must include an 'id' field
  */
 async function handleSaveConfig(event, payload) {
-  const { config } = payload;
+  const config = normalizeDatabaseConfig(payload?.config);
 
   if (!config || !config.id) {
     return { ok: false, error: "Config must include an 'id' field" };
@@ -191,22 +306,11 @@ async function handleDeleteConfig(event, payload) {
 async function handleListConfigs(event) {
   try {
     const configs = await loadConfigs();
-    // Return configs without sensitive fields
     return {
       ok: true,
       configs: configs.map((c) => ({
-        id: c.id,
-        name: c.name,
-        driver: c.driver,
-        host: c.host,
-        port: c.port,
-        database: c.database,
-        username: c.username,
-        // Don't send passwords to renderer
-        hasPassword: Boolean(c.password),
-        ssl: c.ssl,
-        createdAt: c.createdAt,
-        updatedAt: c.updatedAt,
+        ...c,
+        hasPassword: Boolean(c.authPassword),
       })),
     };
   } catch (err) {
@@ -237,16 +341,21 @@ async function handleConnect(event, payload) {
 
     // If already connected, return success
     if (dbSessions?.has(sessionId)) {
+      event?.sender?.send?.("netcatty:db:statusChange", {
+        sessionId,
+        connected: true,
+      });
       return { ok: true, sessionId, status: dbSessions.get(sessionId).status };
     }
 
     const driver = config.driver;
+    const driverConfig = toDriverConfig(config);
 
     if (driver === "mysql") {
       const bridge = getSubBridge("mysql");
       if (!bridge) return { ok: false, error: "MySQL driver not available" };
 
-      const poolResult = await bridge.createPool(config);
+      const poolResult = await bridge.createPool(driverConfig);
       if (!poolResult.ok) {
         return poolResult;
       }
@@ -258,6 +367,10 @@ async function handleConnect(event, payload) {
         status: "connected",
         connectedAt: Date.now(),
       });
+      event?.sender?.send?.("netcatty:db:statusChange", {
+        sessionId,
+        connected: true,
+      });
 
       return { ok: true, sessionId, driver, status: "connected" };
     }
@@ -266,7 +379,7 @@ async function handleConnect(event, payload) {
       const bridge = getSubBridge("redis");
       if (!bridge) return { ok: false, error: "Redis driver not available" };
 
-      const clientResult = bridge.createClient(config);
+      const clientResult = bridge.createClient(driverConfig);
       if (!clientResult.ok) {
         return clientResult;
       }
@@ -293,6 +406,10 @@ async function handleConnect(event, payload) {
         status: "connected",
         connectedAt: Date.now(),
       });
+      event?.sender?.send?.("netcatty:db:statusChange", {
+        sessionId,
+        connected: true,
+      });
 
       return { ok: true, sessionId, driver, status: "connected" };
     }
@@ -300,6 +417,31 @@ async function handleConnect(event, payload) {
     return { ok: false, error: `Unknown driver: ${driver}` };
   } catch (err) {
     return { ok: false, error: `Failed to connect: ${err.message}` };
+  }
+}
+
+async function handleConnectWithConfig(event, payload) {
+  const config = normalizeDatabaseConfig(payload?.config);
+
+  if (!config || !config.id) {
+    return { ok: false, error: "Config with ID is required" };
+  }
+
+  try {
+    const configs = await loadConfigs();
+    const existingIdx = configs.findIndex((item) => item.id === config.id);
+    if (existingIdx >= 0) {
+      configs[existingIdx] = {
+        ...configs[existingIdx],
+        ...config,
+      };
+    } else {
+      configs.push(config);
+    }
+    await saveConfigs(configs);
+    return handleConnect(event, { id: config.id });
+  } catch (err) {
+    return { ok: false, error: `Failed to connect with config: ${err.message}` };
   }
 }
 
@@ -322,6 +464,10 @@ async function handleDisconnect(event, payload) {
   try {
     await disconnectClient(sessionId, session.driver, session.clientOrPool);
     dbSessions.delete(sessionId);
+    event?.sender?.send?.("netcatty:db:statusChange", {
+      sessionId,
+      connected: false,
+    });
     return { ok: true, disconnected: sessionId };
   } catch (err) {
     return { ok: false, error: `Failed to disconnect: ${err.message}` };
@@ -486,6 +632,7 @@ function registerHandlers(ipcMain) {
   ipcMain.handle("netcatty:db:deleteConfig", handleDeleteConfig);
   ipcMain.handle("netcatty:db:listConfigs", handleListConfigs);
   ipcMain.handle("netcatty:db:connect", handleConnect);
+  ipcMain.handle("netcatty:db:connectWithConfig", handleConnectWithConfig);
   ipcMain.handle("netcatty:db:disconnect", handleDisconnect);
   ipcMain.handle("netcatty:db:getStatus", handleGetStatus);
   ipcMain.handle("netcatty:db:execute", handleExecute);

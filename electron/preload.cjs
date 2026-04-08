@@ -1337,60 +1337,16 @@ const api = {
     return () => ipcRenderer.removeListener("netcatty:ai:agent:exit", handler);
   },
 
-  // ── Database IPC ──
-  // Helper to map domain field names to bridge field names
-  // Domain uses: username, authPassword, tls, tlsCert, tlsKey, tlsCa
-  // Bridge expects: user, password, ssl, sslCert, sslKey, sslCa
-  function mapConfigToBridge(config) {
-    if (!config) return config;
-    const mapped = { ...config };
-    // Map domain fields to bridge fields
-    if (mapped.username !== undefined) {
-      mapped.user = mapped.username;
-      delete mapped.username;
-    }
-    if (mapped.authPassword !== undefined) {
-      mapped.password = mapped.authPassword;
-      delete mapped.authPassword;
-    }
-    // tls -> ssl is a direct rename
-    if (mapped.tls !== undefined) {
-      mapped.ssl = mapped.tls;
-      delete mapped.tls;
-    }
-    // tlsCert/tlsKey/tlsCa -> sslCert/sslKey/sslCa
-    if (mapped.tlsCert !== undefined) {
-      mapped.sslCert = mapped.tlsCert;
-      delete mapped.tlsCert;
-    }
-    if (mapped.tlsKey !== undefined) {
-      mapped.sslKey = mapped.tlsKey;
-      delete mapped.tlsKey;
-    }
-    if (mapped.tlsCa !== undefined) {
-      mapped.sslCa = mapped.tlsCa;
-      delete mapped.tlsCa;
-    }
-    if (mapped.tlsRejectUnauthorized !== undefined) {
-      mapped.sslRejectUnauthorized = mapped.tlsRejectUnauthorized;
-      delete mapped.tlsRejectUnauthorized;
-    }
-    return mapped;
-  }
-
   db: {
     // Connection Management
     listConfigs: () => ipcRenderer.invoke("netcatty:db:listConfigs"),
-    testConnection: (config) => {
-      const mappedConfig = mapConfigToBridge(config);
-      return ipcRenderer.invoke("netcatty:db:testConnection", { driver: mappedConfig.driver, config: mappedConfig });
-    },
-    saveConfig: (config) => {
-      const mappedConfig = mapConfigToBridge(config);
-      return ipcRenderer.invoke("netcatty:db:saveConfig", { config: mappedConfig });
-    },
+    testConnection: (config) =>
+      ipcRenderer.invoke("netcatty:db:testConnection", { driver: config?.driver, config }),
+    saveConfig: (config) =>
+      ipcRenderer.invoke("netcatty:db:saveConfig", { config }),
     deleteConfig: (configId) => ipcRenderer.invoke("netcatty:db:deleteConfig", { id: configId }),
     connect: (configId) => ipcRenderer.invoke("netcatty:db:connect", { id: configId }),
+    connectWithConfig: (config) => ipcRenderer.invoke("netcatty:db:connectWithConfig", { config }),
     disconnect: (sessionId) => ipcRenderer.invoke("netcatty:db:disconnect", { sessionId }),
     getStatus: (sessionId) => ipcRenderer.invoke("netcatty:db:getStatus", { sessionId }),
 
@@ -1415,8 +1371,8 @@ const api = {
   // ── Generic Credentials IPC ──
   genericCredentials: {
     list: () => ipcRenderer.invoke("netcatty:genericCredentials:list"),
-    save: (credential) => ipcRenderer.invoke("netcatty:genericCredentials:save", credential),
-    delete: (id) => ipcRenderer.invoke("netcatty:genericCredentials:delete", id),
+    save: (credential) => ipcRenderer.invoke("netcatty:genericCredentials:save", { credential }),
+    delete: (id) => ipcRenderer.invoke("netcatty:genericCredentials:delete", { id }),
   },
 };
 

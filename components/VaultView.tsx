@@ -33,6 +33,7 @@ import {
 } from "lucide-react";
 import React, { Suspense, lazy, memo, startTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useI18n } from "../application/i18n/I18nProvider";
+import { activeTabStore } from "../application/state/activeTabStore";
 import { useStoredViewMode } from "../application/state/useStoredViewMode";
 import { useStoredBoolean } from "../application/state/useStoredBoolean";
 import { useTreeExpandedState } from "../application/state/useTreeExpandedState";
@@ -98,12 +99,12 @@ import { Tooltip, TooltipContent, TooltipTrigger, TooltipProvider } from "./ui/t
 import { Badge } from "./ui/badge";
 import { HotkeyScheme, KeyBinding } from "../domain/models";
 import type { DatabaseConfig, DatabaseSession } from "../domain/databaseModels";
-import { DatabaseView } from "./database";
+import { DatabaseDetailsPanel, DatabaseView } from "./database";
 
 const LazyProtocolSelectDialog = lazy(() => import("./ProtocolSelectDialog"));
 const LazyConnectionLogsManager = lazy(() => import("./ConnectionLogsManager"));
 
-export type VaultSection = "hosts" | "keys" | "snippets" | "port" | "knownhosts" | "logs" | "databases" | "credentials";
+export type VaultSection = "hosts" | "keys" | "snippets" | "port" | "knownhosts" | "logs" | "databases";
 
 type DropTarget =
   | { kind: "root" }
@@ -151,6 +152,8 @@ interface VaultViewProps {
   onRunSnippet?: (snippet: Snippet, targetHosts: Host[]) => void;
   groupConfigs: GroupConfig[];
   onUpdateGroupConfigs: (configs: GroupConfig[]) => void;
+  onDatabaseSessionsChange?: (sessions: DatabaseSession[]) => void;
+  onDatabaseConfigsChange?: (configs: DatabaseConfig[]) => void;
   // Optional: navigate to a specific section on mount or when changed
   navigateToSection?: VaultSection | null;
   onNavigateToSectionHandled?: () => void;
@@ -197,6 +200,8 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
   onRunSnippet,
   groupConfigs,
   onUpdateGroupConfigs,
+  onDatabaseSessionsChange,
+  onDatabaseConfigsChange,
   navigateToSection,
   onNavigateToSectionHandled,
 }) => {
@@ -226,7 +231,7 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
   const [databaseConfigs, setDatabaseConfigs] = useState<DatabaseConfig[]>([]);
   const [databaseSessions, setDatabaseSessions] = useState<DatabaseSession[]>([]);
 
-  // Generic credentials state
+  // Credentials state
   const [credentials, setCredentials] = useState<GenericCredential[]>([]);
 
   useInstantThemeSwitch(rootRef);
@@ -419,7 +424,7 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
   );
 
   // Database state editing
-  const [_databaseEditingConfig, setDatabaseEditingConfig] = useState<DatabaseConfig | null>(null);
+  const [databaseEditingConfig, setDatabaseEditingConfig] = useState<Partial<DatabaseConfig> | null>(null);
 
   // Load database configs on mount
   useEffect(() => {
@@ -439,6 +444,14 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
     loadConfigs();
   }, []);
 
+  useEffect(() => {
+    onDatabaseConfigsChange?.(databaseConfigs);
+  }, [databaseConfigs, onDatabaseConfigsChange]);
+
+  useEffect(() => {
+    onDatabaseSessionsChange?.(databaseSessions);
+  }, [databaseSessions, onDatabaseSessionsChange]);
+
   // Subscribe to database status changes
   useEffect(() => {
     let unsubscribe: (() => void) | undefined;
@@ -448,7 +461,7 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
         const bridge = bridgeModule.get();
         if (!bridge?.db) return;
         unsubscribe = bridge.db.onStatusChange((payload) => {
-          const { sessionId, connected, error, serverVersion } = payload;
+          const { sessionId, connected, serverVersion } = payload;
 
           if (connected) {
             // Update existing session or create new one
@@ -491,21 +504,7 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
               return prev;
             });
           } else {
-            // Mark as disconnected or remove
-            setDatabaseSessions(prev =>
-              prev.map(s =>
-                s.id === sessionId
-                  ? {
-                      ...s,
-                      status: {
-                        ...s.status,
-                        connected: false,
-                        error,
-                      },
-                    }
-                  : s
-              )
-            );
+            setDatabaseSessions(prev => prev.filter((session) => session.id !== sessionId));
           }
         });
       } catch (err) {
@@ -519,12 +518,81 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
   }, [databaseConfigs]);
 
   // Database handlers
+  // Helper to enrich database config with full SSH host details
+  const enrichDatabaseConfigWithSshHost = useCallback((config: DatabaseConfig): DatabaseConfig => {
+    if (!config.sshTunnelHostId) return config;
+
+    // Find the SSH host from vault
+    const sshHost = hosts.find(h => h.id === config.sshTunnelHostId);
+    if (!sshHost) {
+      console.warn(`[VaultView] SSH tunnel host not found: ${config.sshTunnelHostId}`);
+      return config;
+    }
+
+    // Extract SSH connection details from the host
+    const sshConfig: {
+      hostname: string;
+      port: number;
+      username: string;
+      password?: string;
+      privateKey?: string;
+      passphrase?: string;
+      certificate?: string;
+      identityFilePaths?: string[];
+      jumpHosts?: string[];
+      proxy?: unknown;
+    } = {
+      hostname: sshHost.hostname,
+      port: sshHost.port || 22,
+      username: sshHost.username || "",
+    };
+
+    // Copy identity info if present
+    if (sshHost.identityId) {
+      const identity = identities.find(id => id.id === sshHost.identityId);
+      if (identity) {
+        if (identity.privateKey) sshConfig.privateKey = identity.privateKey;
+        if (identity.passphrase) sshConfig.passphrase = identity.passphrase;
+        if (identity.certificate) sshConfig.certificate = identity.certificate;
+      }
+    }
+
+    // Copy proxy settings if present
+    if (sshHost.proxy) {
+      sshConfig.proxy = sshHost.proxy;
+    }
+
+    // Copy jump hosts if present
+    if (sshHost.jumpHostIds && sshHost.jumpHostIds.length > 0) {
+      // Build jump hosts config from referenced hosts
+      const jumpHostConfigs: string[] = [];
+      for (const jumpHostId of sshHost.jumpHostIds) {
+        const jumpHost = hosts.find(h => h.id === jumpHostId);
+        if (jumpHost) {
+          // For jump hosts, we store the connection info needed
+          jumpHostConfigs.push(jumpHostId);
+        }
+      }
+      if (jumpHostConfigs.length > 0) {
+        sshConfig.jumpHosts = jumpHostConfigs;
+      }
+    }
+
+    return {
+      ...config,
+      sshHostConfig: sshConfig,
+    };
+  }, [hosts, identities]);
+
   const handleDatabaseConnect = useCallback(async (configId: string) => {
     const config = databaseConfigs.find(c => c.id === configId);
     if (!config) {
       toast.error('Configuration not found');
       return;
     }
+
+    // Enrich config with full SSH host details if SSH tunnel is configured
+    const enrichedConfig = enrichDatabaseConfigWithSshHost(config);
 
     try {
       const { netcattyBridge: bridgeModule } = await import("../infrastructure/services/netcattyBridge");
@@ -533,8 +601,9 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
         toast.error('Database bridge unavailable');
         return;
       }
-      const result = await bridge.db.connect(configId);
+      const result = await bridge.db.connectWithConfig(enrichedConfig);
       if (result.ok) {
+        activeTabStore.setActiveTabId(`database:${configId}`);
         // Session will be created via status change event
         toast.success(`Connected to ${config.label}`);
       } else {
@@ -543,7 +612,7 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
     } catch (err) {
       toast.error(`Connection failed: ${err}`);
     }
-  }, [databaseConfigs]);
+  }, [databaseConfigs, enrichDatabaseConfigWithSshHost]);
 
   const handleDatabaseDisconnect = useCallback(async (sessionId: string) => {
     try {
@@ -622,102 +691,41 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
     }
   }, []);
 
-  const handleDatabaseEditConfig = useCallback((config: DatabaseConfig) => {
-    setDatabaseEditingConfig(config.id ? config : { ...config, id: crypto.randomUUID() });
+  const closeDatabaseDetailsPanel = useCallback(() => {
+    setDatabaseEditingConfig(null);
+  }, []);
+
+  const handleDatabaseEditConfig = useCallback((config: Partial<DatabaseConfig>) => {
+    setDatabaseEditingConfig(config);
   }, []);
 
   const handleDatabaseTestConnection = useCallback(async (config: DatabaseConfig) => {
+    // Enrich config with full SSH host details if SSH tunnel is configured
+    const enrichedConfig = enrichDatabaseConfigWithSshHost(config);
+
     try {
       const { netcattyBridge: bridgeModule } = await import("../infrastructure/services/netcattyBridge");
       const bridge = bridgeModule.get();
       if (!bridge?.db) {
         toast.error('Database bridge unavailable');
-        return;
+        return { ok: false, error: 'Database bridge unavailable' };
       }
       toast.info(`Testing connection to ${config.label}...`);
-      const result = await bridge.db.testConnection(config);
+      const result = await bridge.db.testConnection(enrichedConfig);
       if (result.ok) {
         toast.success(`Connection test successful for ${config.label}`);
       } else {
         toast.error(result.error || `Connection test failed for ${config.label}`);
       }
+      return result;
     } catch (err) {
       toast.error(`Test failed: ${err}`);
+      return { ok: false, error: String(err) };
     }
-  }, []);
+  }, [enrichDatabaseConfigWithSshHost]);
 
-  // Load credentials when section changes to credentials
-  useEffect(() => {
-    if (currentSection === "credentials") {
-      loadCredentialsFromBridge();
-    }
-  }, [currentSection, loadCredentialsFromBridge]);
-
-  const loadCredentialsFromBridge = useCallback(async () => {
-    try {
-      const { netcattyBridge: bridgeModule } = await import("../infrastructure/services/netcattyBridge");
-      const bridge = bridgeModule.get();
-      if (!bridge?.genericCredentials) {
-        toast.error('Generic credentials bridge unavailable');
-        return;
-      }
-      const result = await bridge.genericCredentials.list();
-      if (result.ok) {
-        setCredentials(result.credentials);
-      } else {
-        toast.error(result.error || "Failed to load credentials");
-      }
-    } catch (err) {
-      toast.error(`Failed to load credentials: ${err}`);
-    }
-  }, []);
-
-  const handleSaveCredential = useCallback(async (credential: GenericCredential) => {
-    try {
-      const { netcattyBridge: bridgeModule } = await import("../infrastructure/services/netcattyBridge");
-      const bridge = bridgeModule.get();
-      if (!bridge?.genericCredentials) {
-        toast.error('Generic credentials bridge unavailable');
-        return;
-      }
-      const result = await bridge.genericCredentials.save(credential);
-      if (result.ok) {
-        setCredentials(prev => {
-          const existingIndex = prev.findIndex(c => c.id === credential.id);
-          if (existingIndex >= 0) {
-            const updated = [...prev];
-            updated[existingIndex] = result.credential;
-            return updated;
-          }
-          return [...prev, result.credential];
-        });
-        toast.success(credential.id ? "Credential updated" : "Credential saved");
-      } else {
-        toast.error(result.error || "Failed to save credential");
-      }
-    } catch (err) {
-      toast.error(`Failed to save credential: ${err}`);
-    }
-  }, []);
-
-  const handleDeleteCredential = useCallback(async (id: string) => {
-    try {
-      const { netcattyBridge: bridgeModule } = await import("../infrastructure/services/netcattyBridge");
-      const bridge = bridgeModule.get();
-      if (!bridge?.genericCredentials) {
-        toast.error('Generic credentials bridge unavailable');
-        return;
-      }
-      const result = await bridge.genericCredentials.delete(id);
-      if (result.ok) {
-        setCredentials(prev => prev.filter(c => c.id !== id));
-        toast.success("Credential deleted");
-      } else {
-        toast.error(result.error || "Failed to delete credential");
-      }
-    } catch (err) {
-      toast.error(`Failed to delete credential: ${err}`);
-    }
+  const handleOpenDatabaseSession = useCallback((sessionId: string) => {
+    activeTabStore.setActiveTabId(`database:${sessionId}`);
   }, []);
 
   const handleNewHost = useCallback(() => {
@@ -2033,24 +2041,6 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
               </TooltipTrigger>
               {sidebarCollapsed && <TooltipContent side="right">{t("vault.nav.databases")}</TooltipContent>}
             </Tooltip>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  variant={currentSection === "credentials" ? "secondary" : "ghost"}
-                  className={cn(
-                    "w-full h-10",
-                    sidebarCollapsed ? "justify-center p-0" : "justify-start gap-3",
-                    currentSection === "credentials" &&
-                    "bg-foreground/10 text-foreground hover:bg-foreground/15 border-border/40",
-                  )}
-                  onClick={() => setCurrentSection("credentials")}
-                >
-                  <Key size={16} className="flex-shrink-0" />
-                  {!sidebarCollapsed && t("vault.nav.credentials")}
-                </Button>
-              </TooltipTrigger>
-              {sidebarCollapsed && <TooltipContent side="right">{t("vault.nav.credentials")}</TooltipContent>}
-            </Tooltip>
           </div>
 
           <div className={cn("mt-auto pb-4 space-y-2", sidebarCollapsed ? "px-1.5" : "px-3")}>
@@ -3145,6 +3135,7 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
             hosts={hosts}
             customGroups={customGroups}
             managedSources={managedSources}
+            credentials={credentials}
             onSave={(k) => onUpdateKeys([...keys, k])}
             onUpdate={(k) =>
               onUpdateKeys(
@@ -3178,6 +3169,19 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
                 Array.from(new Set([...customGroups, groupPath])),
               )
             }
+            onSaveCredential={async (cred) => {
+              // Update or add credential in state
+              setCredentials((prev) => {
+                const existing = prev.find((c) => c.id === cred.id);
+                if (existing) {
+                  return prev.map((c) => (c.id === cred.id ? cred : c));
+                }
+                return [...prev, cred];
+              });
+            }}
+            onDeleteCredential={async (id) => {
+              setCredentials((prev) => prev.filter((c) => c.id !== id));
+            }}
           />
         )}
         {currentSection === "port" && (
@@ -3224,18 +3228,11 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
             sessions={databaseSessions}
             onConnect={handleDatabaseConnect}
             onDisconnect={handleDatabaseDisconnect}
+            onOpenSession={handleOpenDatabaseSession}
             onSaveConfig={handleDatabaseSaveConfig}
             onDeleteConfig={handleDatabaseDeleteConfig}
             onEditConfig={handleDatabaseEditConfig}
             onTestConnection={handleDatabaseTestConnection}
-          />
-        )}
-        {/* Credentials Section */}
-        {currentSection === "credentials" && (
-          <CredentialsView
-            credentials={credentials}
-            onSave={handleSaveCredential}
-            onDelete={handleDeleteCredential}
           />
         )}
       </div>
@@ -3298,6 +3295,19 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
             );
           }}
           layout="inline"
+        />
+      )}
+
+      {currentSection === "databases" && databaseEditingConfig && (
+        <DatabaseDetailsPanel
+          key={databaseEditingConfig.id ?? "new-database"}
+          config={databaseEditingConfig}
+          open
+          onClose={closeDatabaseDetailsPanel}
+          onCancel={closeDatabaseDetailsPanel}
+          onSave={handleDatabaseSaveConfig}
+          onTestConnection={handleDatabaseTestConnection}
+          availableHosts={hosts.map((host) => ({ id: host.id, label: host.label }))}
         />
       )}
 

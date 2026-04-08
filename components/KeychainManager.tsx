@@ -22,7 +22,7 @@ import { resolveHostAuth } from "../domain/sshAuth";
 import { STORAGE_KEY_VAULT_KEYS_VIEW_MODE } from "../infrastructure/config/storageKeys";
 import { logger } from "../lib/logger";
 import { cn } from "../lib/utils";
-import { Host, Identity, KeyType, SSHKey } from "../types";
+import { Host, Identity, KeyType, SSHKey, GenericCredential } from "../types";
 import { ManagedSource } from "../domain/models";
 import { useKeychainBackend } from "../application/state/useKeychainBackend";
 import SelectHostPanel from "./SelectHostPanel";
@@ -55,6 +55,7 @@ import { toast } from "./ui/toast";
 import {
   type FilterTab,
   GenerateStandardPanel,
+  CredentialsView,
   IdentityCard,
   IdentityPanel,
   ImportKeyPanel,
@@ -70,6 +71,7 @@ interface KeychainManagerProps {
   hosts?: Host[];
   customGroups?: string[];
   managedSources?: ManagedSource[];
+  credentials?: GenericCredential[];
   onSave: (key: SSHKey) => void;
   onUpdate: (key: SSHKey) => void;
   onDelete: (id: string) => void;
@@ -78,6 +80,8 @@ interface KeychainManagerProps {
   onNewHost?: () => void;
   onSaveHost?: (host: Host) => void;
   onCreateGroup?: (groupPath: string) => void;
+  onSaveCredential?: (credential: GenericCredential) => Promise<void>;
+  onDeleteCredential?: (id: string) => Promise<void>;
 }
 
 const KeychainManager: React.FC<KeychainManagerProps> = ({
@@ -86,6 +90,7 @@ const KeychainManager: React.FC<KeychainManagerProps> = ({
   hosts = [],
   customGroups = [],
   managedSources = [],
+  credentials = [],
   onSave,
   onUpdate,
   onDelete,
@@ -94,6 +99,8 @@ const KeychainManager: React.FC<KeychainManagerProps> = ({
   onNewHost: _onNewHost,
   onSaveHost,
   onCreateGroup,
+  onSaveCredential,
+  onDeleteCredential,
 }) => {
   const { t } = useI18n();
   const { generateKeyPair, execCommand } = useKeychainBackend();
@@ -180,6 +187,9 @@ echo $3 >> "$FILE"`);
         result = result.filter(
           (k) => k.category === "certificate" || k.certificate,
         );
+        break;
+      case "credential":
+        // Credentials are shown separately, not filtered here
         break;
     }
 
@@ -631,6 +641,25 @@ echo $3 >> "$FILE"`);
                 </Button>
               </DropdownContent>
             </Dropdown>
+
+            {/* CREDENTIAL button */}
+            <Button
+              size="sm"
+              variant="ghost"
+              className={cn(
+                "h-8 px-3 gap-2",
+                activeFilter === "credential" ? "bg-primary/15 text-primary" : "hover:bg-accent",
+              )}
+              onClick={() => setActiveFilter("credential")}
+            >
+              <Key size={14} />
+              {t("keychain.filter.credential")}
+              {credentials.length > 0 && (
+                <span className="text-[10px] px-1.5 rounded-full bg-muted text-muted-foreground">
+                  {credentials.length}
+                </span>
+              )}
+            </Button>
           </div>
 
           {/* Search and View Mode - hide search when panel is open */}
@@ -815,6 +844,21 @@ echo $3 >> "$FILE"`);
                 </ContextMenu>
               ))}
             </div>
+          </div>
+        )}
+
+        {/* Credentials Section */}
+        {activeFilter === "credential" && (
+          <div className="flex-1 overflow-auto p-4">
+            <CredentialsView
+              credentials={credentials}
+              onSave={async (cred) => {
+                await onSaveCredential?.(cred);
+              }}
+              onDelete={async (id) => {
+                await onDeleteCredential?.(id);
+              }}
+            />
           </div>
         )}
       </div>

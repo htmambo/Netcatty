@@ -92,4 +92,4 @@ export type PanelMode =
     | { type: 'export'; key: SSHKey };
 
 // Filter tab types
-export type FilterTab = 'key' | 'certificate';
+export type FilterTab = 'key' | 'certificate' | 'credential';
