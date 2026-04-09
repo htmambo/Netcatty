@@ -179,6 +179,12 @@ function App({ settings }: { settings: SettingsState }) {
   // Database sessions for TopTabs routing
   const [databaseSessions, setDatabaseSessions] = useState<import('./domain/databaseModels').DatabaseSession[]>([]);
   const handleCloseDatabaseSession = useCallback((sessionId: string) => {
+    // Fire-and-forget: disconnect backend connection asynchronously
+    (async () => {
+      const { netcattyBridge: bridgeModule } = await import('./infrastructure/services/netcattyBridge');
+      const bridge = bridgeModule.get();
+      await bridge?.db?.disconnect(sessionId);
+    })();
     if (activeTabStore.getActiveTabId() === `database:${sessionId}`) {
       activeTabStore.setActiveTabId('vault');
     }

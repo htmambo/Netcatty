@@ -852,6 +852,9 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
       }
       const result = await bridge.db.disconnect(sessionId);
       if (result.ok) {
+        if (activeTabStore.getActiveTabId() === `database:${sessionId}`) {
+          activeTabStore.setActiveTabId('vault');
+        }
         setDatabaseSessions(prev => prev.filter(s => s.id !== sessionId));
         setDatabaseSchemas((prev) => {
           const next = { ...prev };
