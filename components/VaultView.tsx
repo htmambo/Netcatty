@@ -33,7 +33,7 @@ import {
 } from "lucide-react";
 import React, { Suspense, lazy, memo, startTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useI18n } from "../application/i18n/I18nProvider";
-import { activeTabStore } from "../application/state/activeTabStore";
+import { activeTabStore, useActiveTabId } from "../application/state/activeTabStore";
 import { useStoredViewMode } from "../application/state/useStoredViewMode";
 import { useStoredBoolean } from "../application/state/useStoredBoolean";
 import { useTreeExpandedState } from "../application/state/useTreeExpandedState";
@@ -41,6 +41,7 @@ import { resolveGroupDefaults, applyGroupDefaults } from "../domain/groupConfig"
 import { getEffectiveHostDistro, sanitizeHost } from "../domain/host";
 import { importVaultHostsFromText, exportHostsToCsvWithStats } from "../domain/vaultImport";
 import type { VaultImportFormat } from "../domain/vaultImport";
+import { tokenizeDatabaseCommand } from "../domain/databaseSchemaView";
 import { STORAGE_KEY_VAULT_HOSTS_VIEW_MODE, STORAGE_KEY_VAULT_HOSTS_TREE_EXPANDED, STORAGE_KEY_VAULT_SIDEBAR_COLLAPSED, STORAGE_KEY_SHOW_RECENT_HOSTS } from "../infrastructure/config/storageKeys";
 import { cn } from "../lib/utils";
 import { useInstantThemeSwitch } from "../lib/useInstantThemeSwitch";
@@ -99,7 +100,7 @@ import { Tooltip, TooltipContent, TooltipTrigger, TooltipProvider } from "./ui/t
 import { Badge } from "./ui/badge";
 import { HotkeyScheme, KeyBinding } from "../domain/models";
 import type { DatabaseConfig, DatabaseSession } from "../domain/databaseModels";
-import { DatabaseDetailsPanel, DatabaseView } from "./database";
+import { DatabaseDetailsPanel, DatabaseSessionPanel } from "./database";
 
 const LazyProtocolSelectDialog = lazy(() => import("./ProtocolSelectDialog"));
 const LazyConnectionLogsManager = lazy(() => import("./ConnectionLogsManager"));
@@ -109,6 +110,16 @@ export type VaultSection = "hosts" | "keys" | "snippets" | "port" | "knownhosts"
 type DropTarget =
   | { kind: "root" }
   | { kind: "group"; path: string };
+
+type VaultGenericCredentialsBridge = {
+  genericCredentials?: {
+    list?: () => Promise<{ ok: boolean; credentials?: GenericCredential[]; error?: string }>;
+    save?: (
+      credential: GenericCredential,
+    ) => Promise<{ ok: boolean; credential?: GenericCredential; error?: string }>;
+    delete?: (id: string) => Promise<{ ok: boolean; deleted?: string; error?: string }>;
+  };
+};
 
 // Props without isActive - it's now subscribed internally
 interface VaultViewProps {
@@ -230,9 +241,84 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
   // Database state (local for MVP)
   const [databaseConfigs, setDatabaseConfigs] = useState<DatabaseConfig[]>([]);
   const [databaseSessions, setDatabaseSessions] = useState<DatabaseSession[]>([]);
+  const [databaseSchemas, setDatabaseSchemas] = useState<Record<string, unknown>>({});
+  const activeTabId = useActiveTabId();
+  const isDatabaseTabActive = activeTabId.startsWith("database:");
+  const activeDatabaseSessionId = isDatabaseTabActive
+    ? activeTabId.replace("database:", "")
+    : null;
+  const activeDatabaseSession = activeDatabaseSessionId
+    ? databaseSessions.find((session) => session.id === activeDatabaseSessionId) || null
+    : null;
+  const activeDatabaseConfig = activeDatabaseSession
+    ? databaseConfigs.find((config) => config.id === activeDatabaseSession.configId) || null
+    : null;
+
+  const upsertDatabaseSession = useCallback(
+    (
+      sessionId: string,
+      config: DatabaseConfig,
+      statusOverrides?: Partial<DatabaseSession["status"]>,
+    ) => {
+      setDatabaseSessions((prev) => {
+        const existing = prev.find((session) => session.id === sessionId);
+        const nextStatus = {
+          connected: true,
+          sessionId,
+          driver: config.driver,
+          ...statusOverrides,
+        };
+
+        if (existing) {
+          return prev.map((session) =>
+            session.id === sessionId
+              ? {
+                  ...session,
+                  configId: config.id,
+                  driver: config.driver,
+                  label: config.label,
+                  status: {
+                    ...session.status,
+                    ...nextStatus,
+                  },
+                  lastActivity: Date.now(),
+                }
+              : session,
+          );
+        }
+
+        return [
+          ...prev,
+          {
+            id: sessionId,
+            configId: config.id,
+            driver: config.driver,
+            label: config.label,
+            status: nextStatus,
+            createdAt: Date.now(),
+            lastActivity: Date.now(),
+          },
+        ];
+      });
+    },
+    [],
+  );
 
   // Credentials state
   const [credentials, setCredentials] = useState<GenericCredential[]>([]);
+
+  const loadVaultCredentials = useCallback(async () => {
+    try {
+      const { netcattyBridge: bridgeModule } = await import("../infrastructure/services/netcattyBridge");
+      const bridge = bridgeModule.get() as VaultGenericCredentialsBridge | undefined;
+      const result = await bridge?.genericCredentials?.list?.();
+      if (result?.ok) {
+        setCredentials(result.credentials || []);
+      }
+    } catch (err) {
+      console.error("Failed to load credentials:", err);
+    }
+  }, []);
 
   useInstantThemeSwitch(rootRef);
 
@@ -254,10 +340,16 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
   // Handle external navigation requests
   useEffect(() => {
     if (navigateToSection) {
-      setCurrentSection(navigateToSection);
+      setCurrentSection(navigateToSection === "databases" ? "hosts" : navigateToSection);
       onNavigateToSectionHandled?.();
     }
   }, [navigateToSection, onNavigateToSectionHandled]);
+
+  useEffect(() => {
+    if (currentSection === "keys") {
+      void loadVaultCredentials();
+    }
+  }, [currentSection, loadVaultCredentials]);
 
   useEffect(() => {
     return () => {
@@ -452,6 +544,52 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
     onDatabaseSessionsChange?.(databaseSessions);
   }, [databaseSessions, onDatabaseSessionsChange]);
 
+  const loadDatabaseSchema = useCallback(async (sessionId: string) => {
+    try {
+      const { netcattyBridge: bridgeModule } = await import("../infrastructure/services/netcattyBridge");
+      const bridge = bridgeModule.get();
+      if (!bridge?.db) return;
+      const schema = await bridge.db.getSchema(sessionId);
+      if (schema) {
+        setDatabaseSchemas((prev) => ({
+          ...prev,
+          [sessionId]: schema,
+        }));
+      }
+    } catch (err) {
+      console.error(`Failed to load schema for session ${sessionId}:`, err);
+    }
+  }, []);
+
+  useEffect(() => {
+    const connectedSessionIds = new Set(
+      databaseSessions
+        .filter((session) => session.status.connected)
+        .map((session) => session.id),
+    );
+
+    for (const sessionId of connectedSessionIds) {
+      if (!databaseSchemas[sessionId]) {
+        void loadDatabaseSchema(sessionId);
+      }
+    }
+
+    setDatabaseSchemas((prev) => {
+      let changed = false;
+      const next: Record<string, unknown> = {};
+
+      for (const [sessionId, schema] of Object.entries(prev)) {
+        if (connectedSessionIds.has(sessionId)) {
+          next[sessionId] = schema;
+        } else {
+          changed = true;
+        }
+      }
+
+      return changed ? next : prev;
+    });
+  }, [databaseSchemas, databaseSessions, loadDatabaseSchema]);
+
   // Subscribe to database status changes
   useEffect(() => {
     let unsubscribe: (() => void) | undefined;
@@ -464,45 +602,14 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
           const { sessionId, connected, serverVersion } = payload;
 
           if (connected) {
-            // Update existing session or create new one
-            setDatabaseSessions(prev => {
-              const existing = prev.find(s => s.id === sessionId);
-              if (existing) {
-                return prev.map(s =>
-                  s.id === sessionId
-                    ? {
-                        ...s,
-                        status: {
-                          ...s.status,
-                          connected: true,
-                          serverVersion,
-                          error: undefined,
-                        },
-                        lastActivity: Date.now(),
-                      }
-                    : s
-                );
-              }
-              // Find the config for this session
-              const config = databaseConfigs.find(c => c.id === sessionId);
-              if (config) {
-                return [...prev, {
-                  id: sessionId,
-                  configId: sessionId,
-                  driver: config.driver,
-                  label: config.label,
-                  status: {
-                    connected: true,
-                    sessionId,
-                    driver: config.driver,
-                    serverVersion,
-                  },
-                  createdAt: Date.now(),
-                  lastActivity: Date.now(),
-                }];
-              }
-              return prev;
-            });
+            const config = databaseConfigs.find((item) => item.id === sessionId);
+            if (config) {
+              upsertDatabaseSession(sessionId, config, {
+                connected: true,
+                serverVersion,
+                error: undefined,
+              });
+            }
           } else {
             setDatabaseSessions(prev => prev.filter((session) => session.id !== sessionId));
           }
@@ -515,7 +622,7 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
     return () => {
       if (unsubscribe) unsubscribe();
     };
-  }, [databaseConfigs]);
+  }, [databaseConfigs, upsertDatabaseSession]);
 
   // Database handlers
   // Helper to enrich database config with full SSH host details
@@ -603,8 +710,17 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
       }
       const result = await bridge.db.connectWithConfig(enrichedConfig);
       if (result.ok) {
-        activeTabStore.setActiveTabId(`database:${configId}`);
-        // Session will be created via status change event
+        const sessionId = result.sessionId || enrichedConfig.id;
+        upsertDatabaseSession(sessionId, config, {
+          connected: true,
+          error: undefined,
+        });
+        setIsHostPanelOpen(false);
+        setEditingHost(null);
+        setIsGroupPanelOpen(false);
+        setEditingGroupPath(null);
+        setDatabaseEditingConfig(null);
+        activeTabStore.setActiveTabId(`database:${sessionId}`);
         toast.success(`Connected to ${config.label}`);
       } else {
         toast.error(result.error || 'Failed to connect');
@@ -612,7 +728,7 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
     } catch (err) {
       toast.error(`Connection failed: ${err}`);
     }
-  }, [databaseConfigs, enrichDatabaseConfigWithSshHost]);
+  }, [databaseConfigs, enrichDatabaseConfigWithSshHost, upsertDatabaseSession]);
 
   const handleDatabaseDisconnect = useCallback(async (sessionId: string) => {
     try {
@@ -625,6 +741,11 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
       const result = await bridge.db.disconnect(sessionId);
       if (result.ok) {
         setDatabaseSessions(prev => prev.filter(s => s.id !== sessionId));
+        setDatabaseSchemas((prev) => {
+          const next = { ...prev };
+          delete next[sessionId];
+          return next;
+        });
         toast.success('Disconnected');
       } else {
         toast.error(result.error || 'Failed to disconnect');
@@ -635,6 +756,7 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
   }, []);
 
   const handleDatabaseSaveConfig = useCallback(async (config: DatabaseConfig) => {
+    const isExistingConfig = Boolean(config.id);
     const newConfig = {
       ...config,
       id: config.id || crypto.randomUUID(),
@@ -659,7 +781,7 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
           }
           return [...prev, newConfig];
         });
-        toast.success(newConfig.id ? 'Configuration updated' : 'Configuration saved');
+        toast.success(isExistingConfig ? 'Configuration updated' : 'Configuration saved');
         setDatabaseEditingConfig(null);
       } else {
         toast.error(result.error || 'Failed to save configuration');
@@ -682,6 +804,7 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
         setDatabaseConfigs(prev => prev.filter(c => c.id !== configId));
         // Also disconnect any active sessions for this config
         setDatabaseSessions(prev => prev.filter(s => s.configId !== configId));
+        setDatabaseEditingConfig((prev) => (prev?.id === configId ? null : prev));
         toast.success('Configuration deleted');
       } else {
         toast.error(result.error || 'Failed to delete configuration');
@@ -696,6 +819,10 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
   }, []);
 
   const handleDatabaseEditConfig = useCallback((config: Partial<DatabaseConfig>) => {
+    setIsHostPanelOpen(false);
+    setEditingHost(null);
+    setIsGroupPanelOpen(false);
+    setEditingGroupPath(null);
     setDatabaseEditingConfig(config);
   }, []);
 
@@ -725,8 +852,177 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
   }, [enrichDatabaseConfigWithSshHost]);
 
   const handleOpenDatabaseSession = useCallback((sessionId: string) => {
+    setIsHostPanelOpen(false);
+    setEditingHost(null);
+    setIsGroupPanelOpen(false);
+    setEditingGroupPath(null);
+    setDatabaseEditingConfig(null);
     activeTabStore.setActiveTabId(`database:${sessionId}`);
   }, []);
+
+  const databaseSessionByConfigId = useMemo(() => {
+    const map = new Map<string, DatabaseSession>();
+    for (const session of databaseSessions) {
+      if (session.status.connected) {
+        map.set(session.configId, session);
+      }
+    }
+    return map;
+  }, [databaseSessions]);
+
+  const handleNewDatabase = useCallback((groupPath?: string | null) => {
+    setIsHostPanelOpen(false);
+    setEditingHost(null);
+    setIsGroupPanelOpen(false);
+    setEditingGroupPath(null);
+    setDatabaseEditingConfig({
+      driver: "mysql",
+      group: groupPath || selectedGroupPath || undefined,
+    });
+  }, [selectedGroupPath]);
+
+  const handleOpenDatabaseConfig = useCallback((config: DatabaseConfig) => {
+    const activeSession = databaseSessionByConfigId.get(config.id);
+    if (activeSession?.status.connected) {
+      handleOpenDatabaseSession(activeSession.id);
+      return;
+    }
+    void handleDatabaseConnect(config.id);
+  }, [databaseSessionByConfigId, handleDatabaseConnect, handleOpenDatabaseSession]);
+
+  const renderDatabaseCard = useCallback((config: DatabaseConfig) => {
+    const activeSession = databaseSessionByConfigId.get(config.id);
+    const isConnected = !!activeSession?.status.connected;
+    const subtitle = config.driver === "sqlite"
+      ? (config.filePath || t("database.filePath"))
+      : `${config.username || "-"}@${config.host || "localhost"}${config.port ? `:${config.port}` : ""}`;
+
+    return (
+      <ContextMenu key={config.id}>
+        <ContextMenuTrigger>
+          <div
+            className={cn(
+              "group cursor-pointer relative",
+              viewMode === "grid"
+                ? "soft-card elevate rounded-xl h-[68px] px-3 py-2"
+                : "h-14 px-3 py-2 hover:bg-secondary/60 rounded-lg transition-colors",
+              isConnected && "ring-1 ring-emerald-500/40",
+            )}
+            onClick={() => handleOpenDatabaseConfig(config)}
+          >
+            <div className="flex items-center gap-3 h-full">
+              <div className="h-10 w-10 rounded-xl bg-[#44779F]/12 text-[#44779F] flex items-center justify-center shrink-0">
+                <Database size={18} />
+              </div>
+              <div className="min-w-0 flex flex-col justify-center gap-0.5 flex-1">
+                <div className="flex items-center gap-1.5">
+                  <span className="text-sm font-semibold truncate leading-5">
+                    {config.label}
+                  </span>
+                  <Badge variant="outline" className="text-[10px] px-1.5 py-0 h-4 shrink-0">
+                    {config.driver.toUpperCase()}
+                  </Badge>
+                  {isConnected && (
+                    <span className="h-2 w-2 rounded-full bg-emerald-500 shrink-0" />
+                  )}
+                </div>
+                <div className="text-[11px] text-muted-foreground font-mono truncate leading-4">
+                  {subtitle}
+                </div>
+              </div>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-8 w-8 opacity-0 group-hover:opacity-100 transition-opacity shrink-0"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  handleDatabaseEditConfig(config);
+                }}
+              >
+                <Edit2 size={14} />
+              </Button>
+            </div>
+          </div>
+        </ContextMenuTrigger>
+        <ContextMenuContent>
+          <ContextMenuItem onClick={() => handleOpenDatabaseConfig(config)}>
+            <Plug className="mr-2 h-4 w-4" /> {isConnected ? t("action.open") : t("database.connect")}
+          </ContextMenuItem>
+          {activeSession?.status.connected && (
+            <ContextMenuItem onClick={() => handleDatabaseDisconnect(activeSession.id)}>
+              <Plug className="mr-2 h-4 w-4" /> {t("database.disconnect")}
+            </ContextMenuItem>
+          )}
+          <ContextMenuItem onClick={() => handleDatabaseEditConfig(config)}>
+            <Edit2 className="mr-2 h-4 w-4" /> {t("action.edit")}
+          </ContextMenuItem>
+          <ContextMenuItem
+            className="text-destructive"
+            onClick={() => handleDatabaseDeleteConfig(config.id)}
+          >
+            <Trash2 className="mr-2 h-4 w-4" /> {t("action.delete")}
+          </ContextMenuItem>
+        </ContextMenuContent>
+      </ContextMenu>
+    );
+  }, [
+    databaseSessionByConfigId,
+    handleDatabaseDeleteConfig,
+    handleDatabaseDisconnect,
+    handleDatabaseEditConfig,
+    handleOpenDatabaseConfig,
+    t,
+    viewMode,
+  ]);
+
+  const handleSaveCredential = useCallback(async (credential: GenericCredential) => {
+    try {
+      const { netcattyBridge: bridgeModule } = await import("../infrastructure/services/netcattyBridge");
+      const bridge = bridgeModule.get() as VaultGenericCredentialsBridge | undefined;
+      const result = await bridge?.genericCredentials?.save?.(credential);
+
+      if (!result?.ok || !result.credential) {
+        const message = result?.error || t("vault.credentials.saveFailed");
+        throw new Error(message);
+      }
+
+      const savedCredential = result.credential;
+      setCredentials((prev) => {
+        const existing = prev.find((item) => item.id === savedCredential.id);
+        if (existing) {
+          return prev.map((item) =>
+            item.id === savedCredential.id ? savedCredential : item,
+          );
+        }
+        return [...prev, savedCredential];
+      });
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : t("vault.credentials.saveFailed");
+      toast.error(message);
+      throw err instanceof Error ? err : new Error(message);
+    }
+  }, [t]);
+
+  const handleDeleteCredential = useCallback(async (id: string) => {
+    try {
+      const { netcattyBridge: bridgeModule } = await import("../infrastructure/services/netcattyBridge");
+      const bridge = bridgeModule.get() as VaultGenericCredentialsBridge | undefined;
+      const result = await bridge?.genericCredentials?.delete?.(id);
+
+      if (!result?.ok) {
+        const message = result?.error || t("vault.credentials.deleteFailed");
+        throw new Error(message);
+      }
+
+      setCredentials((prev) => prev.filter((item) => item.id !== id));
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : t("vault.credentials.deleteFailed");
+      toast.error(message);
+      throw err instanceof Error ? err : new Error(message);
+    }
+  }, [t]);
 
   const handleNewHost = useCallback(() => {
     setIsGroupPanelOpen(false);
@@ -1107,16 +1403,23 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
 
   const countAllHostsInNode = useCallback((node: GroupNode): number => {
     let count = node.hosts.length;
+    let itemCount = count + (node.databaseConfigs?.length || 0);
     Object.values(node.children).forEach((child) => {
       count += countAllHostsInNode(child);
+      itemCount += child.totalItemCount || 0;
     });
     node.totalHostCount = count;
+    node.totalItemCount = itemCount;
     return count;
   }, []);
 
   const buildGroupTree = useMemo<Record<string, GroupNode>>(() => {
     const root: Record<string, GroupNode> = {};
-    const insertPath = (path: string, host?: Host) => {
+    const insertPath = (
+      path: string,
+      host?: Host,
+      databaseConfig?: DatabaseConfig,
+    ) => {
       const parts = path.split("/").filter(Boolean);
       let currentLevel = root;
       let currentPath = "";
@@ -1128,20 +1431,25 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
             path: currentPath,
             children: {},
             hosts: [],
+            databaseConfigs: [],
           };
         }
         if (host && index === parts.length - 1)
           currentLevel[part].hosts.push(host);
+        if (databaseConfig && index === parts.length - 1) {
+          currentLevel[part].databaseConfigs?.push(databaseConfig);
+        }
         currentLevel = currentLevel[part].children;
       });
     };
     customGroups.forEach((path) => insertPath(path));
     hosts.forEach((host) => insertPath(host.group || "General", host));
+    databaseConfigs.forEach((config) => insertPath(config.group || "General", undefined, config));
 
     Object.values(root).forEach(countAllHostsInNode);
 
     return root;
-  }, [hosts, customGroups, countAllHostsInNode]);
+  }, [hosts, customGroups, databaseConfigs, countAllHostsInNode]);
 
   // Generate all possible group paths from the tree (including all intermediate nodes)
   const allGroupPaths = useMemo(() => {
@@ -1171,6 +1479,7 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
         path: "",
         children: buildGroupTree,
         hosts: [],
+        databaseConfigs: [],
       } as GroupNode;
     const parts = path.split("/").filter(Boolean);
     let current: { children?: Record<string, GroupNode>; hosts?: Host[] } = {
@@ -1234,6 +1543,54 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
     });
     return filtered;
   }, [hosts, selectedGroupPath, search, selectedTags, sortMode]);
+
+  const displayedDatabaseConfigs = useMemo(() => {
+    if (selectedTags.length > 0) return [];
+
+    let filtered = databaseConfigs;
+
+    if (selectedGroupPath) {
+      filtered = filtered.filter((config) => {
+        const group = config.group || "";
+        if (selectedGroupPath === "General") {
+          return group === "" || group === "General";
+        }
+        return group === selectedGroupPath;
+      });
+    }
+
+    if (search.trim()) {
+      const query = search.toLowerCase();
+      filtered = filtered.filter((config) =>
+        config.label.toLowerCase().includes(query) ||
+        config.driver.toLowerCase().includes(query) ||
+        (config.host || "").toLowerCase().includes(query) ||
+        (config.database || "").toLowerCase().includes(query) ||
+        (config.username || "").toLowerCase().includes(query),
+      );
+    }
+
+    return [...filtered].sort((a, b) => {
+      switch (sortMode) {
+        case "az":
+          return a.label.localeCompare(b.label);
+        case "za":
+          return b.label.localeCompare(a.label);
+        case "newest":
+          return (b.createdAt || 0) - (a.createdAt || 0);
+        case "oldest":
+          return (a.createdAt || 0) - (b.createdAt || 0);
+        case "group": {
+          const groupA = a.group || "";
+          const groupB = b.group || "";
+          const groupCmp = groupA.localeCompare(groupB);
+          return groupCmp !== 0 ? groupCmp : a.label.localeCompare(b.label);
+        }
+        default:
+          return 0;
+      }
+    });
+  }, [databaseConfigs, search, selectedGroupPath, selectedTags, sortMode]);
 
   // Pinned hosts for root-level display (not inside a subgroup)
   // Respects active search and tag filters
@@ -1326,6 +1683,43 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
     return filtered;
   }, [hosts, search, selectedTags, sortMode]);
 
+  const treeViewDatabaseConfigs = useMemo(() => {
+    if (selectedTags.length > 0) return [];
+
+    let filtered = databaseConfigs;
+    if (search.trim()) {
+      const query = search.toLowerCase();
+      filtered = filtered.filter((config) =>
+        config.label.toLowerCase().includes(query) ||
+        config.driver.toLowerCase().includes(query) ||
+        (config.host || "").toLowerCase().includes(query) ||
+        (config.database || "").toLowerCase().includes(query) ||
+        (config.username || "").toLowerCase().includes(query),
+      );
+    }
+
+    return [...filtered].sort((a, b) => {
+      switch (sortMode) {
+        case "az":
+          return a.label.localeCompare(b.label);
+        case "za":
+          return b.label.localeCompare(a.label);
+        case "newest":
+          return (b.createdAt || 0) - (a.createdAt || 0);
+        case "oldest":
+          return (a.createdAt || 0) - (b.createdAt || 0);
+        case "group": {
+          const groupA = a.group || "";
+          const groupB = b.group || "";
+          const groupCmp = groupA.localeCompare(groupB);
+          return groupCmp !== 0 ? groupCmp : a.label.localeCompare(b.label);
+        }
+        default:
+          return 0;
+      }
+    });
+  }, [databaseConfigs, search, selectedTags, sortMode]);
+
   const groupedDisplayHosts = useMemo(() => {
     if (sortMode !== "group") return null;
     const groups: { name: string; hosts: Host[] }[] = [];
@@ -1346,9 +1740,62 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
     return groups;
   }, [displayedHosts, sortMode]);
 
+  const groupedDisplayDatabases = useMemo(() => {
+    if (sortMode !== "group") return null;
+    const groups: { name: string; configs: DatabaseConfig[] }[] = [];
+    const groupMap = new Map<string, DatabaseConfig[]>();
+
+    for (const config of displayedDatabaseConfigs) {
+      const groupName = config.group || "";
+      if (!groupMap.has(groupName)) {
+        groupMap.set(groupName, []);
+      }
+      groupMap.get(groupName)!.push(config);
+    }
+
+    const sortedKeys = [...groupMap.keys()].sort((a, b) => a.localeCompare(b));
+    for (const key of sortedKeys) {
+      groups.push({ name: key, configs: groupMap.get(key)! });
+    }
+    return groups;
+  }, [displayedDatabaseConfigs, sortMode]);
+
+  const groupedDisplaySections = useMemo(() => {
+    if (sortMode !== "group") return null;
+
+    const sectionMap = new Map<string, { name: string; hosts: Host[]; configs: DatabaseConfig[] }>();
+
+    groupedDisplayHosts?.forEach((group) => {
+      sectionMap.set(group.name, {
+        name: group.name,
+        hosts: group.hosts,
+        configs: [],
+      });
+    });
+
+    groupedDisplayDatabases?.forEach((group) => {
+      const existing = sectionMap.get(group.name);
+      if (existing) {
+        existing.configs = group.configs;
+      } else {
+        sectionMap.set(group.name, {
+          name: group.name,
+          hosts: [],
+          configs: group.configs,
+        });
+      }
+    });
+
+    return [...sectionMap.values()].sort((a, b) => a.name.localeCompare(b.name));
+  }, [groupedDisplayDatabases, groupedDisplayHosts, sortMode]);
+
   const buildTreeViewGroupTree = useMemo<Record<string, GroupNode>>(() => {
     const root: Record<string, GroupNode> = {};
-    const insertPath = (path: string, host?: Host) => {
+    const insertPath = (
+      path: string,
+      host?: Host,
+      databaseConfig?: DatabaseConfig,
+    ) => {
       const parts = path.split("/").filter(Boolean);
       let currentLevel = root;
       let currentPath = "";
@@ -1360,10 +1807,14 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
             path: currentPath,
             children: {},
             hosts: [],
+            databaseConfigs: [],
           };
         }
         if (host && index === parts.length - 1)
           currentLevel[part].hosts.push(host);
+        if (databaseConfig && index === parts.length - 1) {
+          currentLevel[part].databaseConfigs?.push(databaseConfig);
+        }
         currentLevel = currentLevel[part].children;
       });
     };
@@ -1374,11 +1825,16 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
         insertPath(host.group, host);
       }
     });
+    treeViewDatabaseConfigs.forEach((config) => {
+      if (config.group && config.group.trim() !== "") {
+        insertPath(config.group, undefined, config);
+      }
+    });
 
     Object.values(root).forEach(countAllHostsInNode);
     
     return root;
-  }, [treeViewHosts, customGroups, countAllHostsInNode]);
+  }, [treeViewHosts, treeViewDatabaseConfigs, customGroups, countAllHostsInNode]);
 
   // Create tree view specific group tree that excludes ungrouped hosts
   const treeViewGroupTree = useMemo<GroupNode[]>(() => {
@@ -1503,6 +1959,27 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps -- handle* callbacks are stable refs that read from refs
   }, [knownHosts, hosts, onConvertKnownHost]);
 
+  const persistDatabaseConfigUpdates = useCallback(async (configsToPersist: DatabaseConfig[]) => {
+    if (configsToPersist.length === 0) return;
+
+    try {
+      const { netcattyBridge: bridgeModule } = await import("../infrastructure/services/netcattyBridge");
+      const bridge = bridgeModule.get();
+      if (!bridge?.db) {
+        throw new Error("Database bridge unavailable");
+      }
+
+      const results = await Promise.all(configsToPersist.map((config) => bridge.db.saveConfig(config)));
+      const failed = results.find((result) => !result.ok);
+      if (failed) {
+        throw new Error(failed.error || t("database.saveFailed"));
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : t("database.saveFailed");
+      toast.error(message);
+    }
+  }, [t]);
+
   const submitNewFolder = () => {
     if (!newFolderName.trim()) return;
     const fullPath = targetParentPath
@@ -1548,6 +2025,15 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
         return { ...h, group: nextPath + g.slice(renameTargetPath.length) };
       return h;
     });
+    const updatedDatabaseConfigs = databaseConfigs.map((config) => {
+      const group = config.group || "";
+      if (group === renameTargetPath) return { ...config, group: nextPath };
+      if (group.startsWith(renameTargetPath + "/")) {
+        return { ...config, group: nextPath + group.slice(renameTargetPath.length) };
+      }
+      return config;
+    });
+    const changedDatabaseConfigs = updatedDatabaseConfigs.filter((config, index) => config !== databaseConfigs[index]);
 
     // Update managed sources if any match the renamed group path
     const updatedManagedSources = managedSources.map((s) => {
@@ -1562,6 +2048,10 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
 
     onUpdateCustomGroups(Array.from(new Set(updatedGroups)));
     onUpdateHosts(updatedHosts);
+    if (changedDatabaseConfigs.length > 0) {
+      setDatabaseConfigs(updatedDatabaseConfigs);
+      void persistDatabaseConfigUpdates(changedDatabaseConfigs);
+    }
     if (
       selectedGroupPath &&
       (selectedGroupPath === renameTargetPath ||
@@ -1611,6 +2101,13 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
         if (g.startsWith(oldPath + '/')) return { ...h, group: newPath + g.slice(oldPath.length) };
         return h;
       });
+      const updatedDatabaseConfigs = databaseConfigs.map((config) => {
+        const group = config.group || '';
+        if (group === oldPath) return { ...config, group: newPath };
+        if (group.startsWith(oldPath + '/')) return { ...config, group: newPath + group.slice(oldPath.length) };
+        return config;
+      });
+      const changedDatabaseConfigs = updatedDatabaseConfigs.filter((config, index) => config !== databaseConfigs[index]);
       const updatedManagedSources = managedSources.map((s) => {
         if (s.groupName === oldPath) return { ...s, groupName: newPath };
         if (s.groupName.startsWith(oldPath + '/')) return { ...s, groupName: newPath + s.groupName.slice(oldPath.length) };
@@ -1621,6 +2118,10 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
       }
       onUpdateCustomGroups(Array.from(new Set(updatedGroups)));
       onUpdateHosts(updatedHosts);
+      if (changedDatabaseConfigs.length > 0) {
+        setDatabaseConfigs(updatedDatabaseConfigs);
+        void persistDatabaseConfigUpdates(changedDatabaseConfigs);
+      }
       // Update child config paths too
       const finalConfigs = updatedConfigs.map(c => {
         if (c.path.startsWith(oldPath + '/')) return { ...c, path: newPath + c.path.slice(oldPath.length) };
@@ -1637,7 +2138,7 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
 
     setIsGroupPanelOpen(false);
     setEditingGroupPath(null);
-  }, [groupConfigs, editingGroupPath, customGroups, hosts, managedSources, selectedGroupPath, onUpdateGroupConfigs, onUpdateCustomGroups, onUpdateHosts, onUpdateManagedSources, t]);
+  }, [groupConfigs, editingGroupPath, customGroups, databaseConfigs, hosts, managedSources, persistDatabaseConfigUpdates, selectedGroupPath, onUpdateGroupConfigs, onUpdateCustomGroups, onUpdateHosts, onUpdateManagedSources, t]);
 
   const deleteGroupPath = async (path: string, deleteHosts: boolean = false) => {
     const keepGroups = customGroups.filter(
@@ -1690,9 +2191,21 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
         return h;
       });
     }
+    const updatedDatabaseConfigs = databaseConfigs.map((config) => {
+      const group = config.group || "";
+      if (group === path || group.startsWith(path + "/")) {
+        return { ...config, group: "" };
+      }
+      return config;
+    });
+    const changedDatabaseConfigs = updatedDatabaseConfigs.filter((config, index) => config !== databaseConfigs[index]);
 
     onUpdateCustomGroups(keepGroups);
     onUpdateHosts(keepHosts);
+    if (changedDatabaseConfigs.length > 0) {
+      setDatabaseConfigs(updatedDatabaseConfigs);
+      void persistDatabaseConfigUpdates(changedDatabaseConfigs);
+    }
     // Remove configs for deleted group and its children
     const updatedGroupConfigs = groupConfigs.filter(
       (c) => c.path !== path && !c.path.startsWith(path + '/')
@@ -1728,6 +2241,15 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
         return { ...h, group: newPath + g.slice(sourcePath.length) };
       return h;
     });
+    const updatedDatabaseConfigs = databaseConfigs.map((config) => {
+      const group = config.group || "";
+      if (group === sourcePath) return { ...config, group: newPath };
+      if (group.startsWith(sourcePath + "/")) {
+        return { ...config, group: newPath + group.slice(sourcePath.length) };
+      }
+      return config;
+    });
+    const changedDatabaseConfigs = updatedDatabaseConfigs.filter((config, index) => config !== databaseConfigs[index]);
     // Update managed sources if any match the moved group path
     const updatedManagedSources = managedSources.map((s) => {
       if (s.groupName === sourcePath) return { ...s, groupName: newPath };
@@ -1740,6 +2262,10 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
     }
     onUpdateCustomGroups(Array.from(new Set(updatedGroups)));
     onUpdateHosts(updatedHosts);
+    if (changedDatabaseConfigs.length > 0) {
+      setDatabaseConfigs(updatedDatabaseConfigs);
+      void persistDatabaseConfigUpdates(changedDatabaseConfigs);
+    }
     // Update group configs for moved paths
     const updatedGroupConfigs = groupConfigs.map((c) => {
       if (c.path === sourcePath) return { ...c, path: newPath };
@@ -1881,7 +2407,8 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
         <div
           className={cn(
             "bg-secondary/80 border-r border-border/60 flex flex-col transition-all duration-200",
-            sidebarCollapsed ? "w-14" : "w-52"
+            sidebarCollapsed ? "w-14" : "w-52",
+            isDatabaseTabActive && "hidden",
           )}
           data-section="vault-sidebar"
         >
@@ -2023,24 +2550,6 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
               </TooltipTrigger>
               {sidebarCollapsed && <TooltipContent side="right">{t("vault.nav.logs")}</TooltipContent>}
             </Tooltip>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  variant={currentSection === "databases" ? "secondary" : "ghost"}
-                  className={cn(
-                    "w-full h-10",
-                    sidebarCollapsed ? "justify-center p-0" : "justify-start gap-3",
-                    currentSection === "databases" &&
-                    "bg-foreground/10 text-foreground hover:bg-foreground/15 border-border/40",
-                  )}
-                  onClick={() => setCurrentSection("databases")}
-                >
-                  <Database size={16} className="flex-shrink-0" />
-                  {!sidebarCollapsed && t("vault.nav.databases")}
-                </Button>
-              </TooltipTrigger>
-              {sidebarCollapsed && <TooltipContent side="right">{t("vault.nav.databases")}</TooltipContent>}
-            </Tooltip>
           </div>
 
           <div className={cn("mt-auto pb-4 space-y-2", sidebarCollapsed ? "px-1.5" : "px-3")}>
@@ -2066,7 +2575,10 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
 
       {/* Main Area */}
       <div
-        className="flex-1 min-w-0 flex flex-col min-h-0 relative"
+        className={cn(
+          "flex-1 min-w-0 flex flex-col min-h-0 relative",
+          isDatabaseTabActive && "hidden",
+        )}
         data-section="vault-main"
       >
         <header
@@ -2211,6 +2723,13 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
                   </DropdownTrigger>
                 </div>
                 <DropdownContent className="w-44" align="end" alignToParent>
+                  <Button
+                    variant="ghost"
+                    className="w-full justify-start gap-2"
+                    onClick={() => handleNewDatabase(selectedGroupPath)}
+                  >
+                    <Database size={14} /> {t("database.addDatabase")}
+                  </Button>
                   <Button
                     variant="ghost"
                     className="w-full justify-start gap-2"
@@ -2645,7 +3164,7 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
                                     )}
                                   </div>
                                   <div className="text-[11px] text-muted-foreground">
-                                    {t("vault.groups.hostsCount", { count: node.totalHostCount ?? node.hosts.length })}
+                                    {t("vault.groups.entriesCount", { count: node.totalItemCount ?? node.totalHostCount ?? node.hosts.length })}
                                   </div>
                                 </div>
                                 <Button
@@ -2700,7 +3219,11 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
                     </h3>
                     <div className="flex items-center gap-2 text-xs text-muted-foreground">
                       <span>
-                        {t("vault.hosts.header.entries", { count: viewMode === "tree" ? treeViewHosts.length : displayedHosts.length })}
+                        {t("vault.hosts.header.entries", {
+                          count: viewMode === "tree"
+                            ? treeViewHosts.length + treeViewDatabaseConfigs.length
+                            : displayedHosts.length + displayedDatabaseConfigs.length,
+                        })}
                       </span>
                       <div className="bg-secondary/80 border border-border/70 rounded-md px-2 py-1 text-[11px]">
                         {t("vault.hosts.header.live", { count: sessions.length })}
@@ -2755,6 +3278,7 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
                     <HostTreeView
                       groupTree={treeViewGroupTree}
                       hosts={treeViewHosts} // Use filtered and sorted hosts for tree view
+                      databaseConfigs={treeViewDatabaseConfigs}
                       sortMode={sortMode}
                       expandedPaths={treeExpandedState.expandedPaths}
                       onTogglePath={treeExpandedState.togglePath}
@@ -2771,6 +3295,7 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
                         setNewHostGroupPath(groupPath || null);
                         setIsHostPanelOpen(true);
                       }}
+                      onNewDatabase={(groupPath) => handleNewDatabase(groupPath)}
                       onNewGroup={(parentPath) => {
                         setTargetParentPath(parentPath || null);
                         setNewFolderName("");
@@ -2781,6 +3306,9 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
                         setDeleteTargetPath(groupPath);
                         setIsDeleteGroupOpen(true);
                       }}
+                      onOpenDatabase={handleOpenDatabaseConfig}
+                      onEditDatabase={handleDatabaseEditConfig}
+                      onDeleteDatabase={(config) => void handleDatabaseDeleteConfig(config.id)}
                       moveHostToGroup={moveHostToGroup}
                       moveGroup={moveGroup}
                       managedGroupPaths={managedGroupPaths}
@@ -2793,9 +3321,9 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
                       }
                       setDragOverDropTarget={setGroupDragOverDropTarget}
                     />
-                  ) : sortMode === "group" && groupedDisplayHosts ? (
+                  ) : sortMode === "group" && groupedDisplaySections ? (
                     <div className="space-y-6">
-                        {groupedDisplayHosts.map((group) => (
+                        {groupedDisplaySections.map((group) => (
                           <div key={group.name || "__ungrouped__"}>
                             <div className="flex items-center gap-2 mb-3 pb-2 border-b border-border/40">
                               <FolderTree size={14} className="text-muted-foreground" />
@@ -2803,7 +3331,9 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
                                 {group.name || t("vault.groups.ungrouped")}
                               </span>
                               <span className="text-xs text-muted-foreground/60">
-                                ({selectedGroupPath ? group.hosts.length : group.hosts.filter((h) => !pinnedRecentIds.has(h.id)).length})
+                                ({selectedGroupPath
+                                  ? group.hosts.length + group.configs.length
+                                  : group.hosts.filter((h) => !pinnedRecentIds.has(h.id)).length + group.configs.length})
                               </span>
                             </div>
                             <div
@@ -2933,10 +3463,11 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
                                   </ContextMenu>
                                 );
                               })}
+                              {group.configs.map((config) => renderDatabaseCard(config))}
                             </div>
                           </div>
                         ))}
-                        {groupedDisplayHosts.length === 0 && (
+                        {groupedDisplaySections.length === 0 && (
                           <div className="col-span-full flex flex-col items-center justify-center py-24 text-muted-foreground">
                             <div className="h-16 w-16 rounded-2xl bg-secondary/80 flex items-center justify-center mb-4">
                               <LayoutGrid size={32} className="opacity-60" />
@@ -3078,7 +3609,8 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
                             </ContextMenu>
                           );
                       })}
-                      {displayedHosts.length === 0 && (
+                      {displayedDatabaseConfigs.map((config) => renderDatabaseCard(config))}
+                      {displayedHosts.length === 0 && displayedDatabaseConfigs.length === 0 && (
                         <div className="col-span-full flex flex-col items-center justify-center py-24 text-muted-foreground">
                           <div className="h-16 w-16 rounded-2xl bg-secondary/80 flex items-center justify-center mb-4">
                             <LayoutGrid size={32} className="opacity-60" />
@@ -3169,19 +3701,8 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
                 Array.from(new Set([...customGroups, groupPath])),
               )
             }
-            onSaveCredential={async (cred) => {
-              // Update or add credential in state
-              setCredentials((prev) => {
-                const existing = prev.find((c) => c.id === cred.id);
-                if (existing) {
-                  return prev.map((c) => (c.id === cred.id ? cred : c));
-                }
-                return [...prev, cred];
-              });
-            }}
-            onDeleteCredential={async (id) => {
-              setCredentials((prev) => prev.filter((c) => c.id !== id));
-            }}
+            onSaveCredential={handleSaveCredential}
+            onDeleteCredential={handleDeleteCredential}
           />
         )}
         {currentSection === "port" && (
@@ -3221,24 +3742,59 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
             />
           </Suspense>
         )}
-        {/* Database Section */}
-        {currentSection === "databases" && (
-          <DatabaseView
-            configs={databaseConfigs}
-            sessions={databaseSessions}
-            onConnect={handleDatabaseConnect}
-            onDisconnect={handleDatabaseDisconnect}
-            onOpenSession={handleOpenDatabaseSession}
-            onSaveConfig={handleDatabaseSaveConfig}
-            onDeleteConfig={handleDatabaseDeleteConfig}
-            onEditConfig={handleDatabaseEditConfig}
-            onTestConnection={handleDatabaseTestConnection}
-          />
-        )}
       </div>
 
+      {isDatabaseTabActive && activeDatabaseSession && activeDatabaseConfig && (() => {
+        const sessionId = activeDatabaseSession.id;
+
+        const handleExecuteQuery = async (query: string) => {
+          try {
+            const { netcattyBridge: bridgeModule } = await import("../infrastructure/services/netcattyBridge");
+            const bridge = bridgeModule.get();
+            if (!bridge?.db) return { ok: false, error: "Database bridge unavailable" };
+            if (activeDatabaseConfig.driver === "redis") {
+              return await bridge.db.execute(sessionId, tokenizeDatabaseCommand(query));
+            }
+            return await bridge.db.execute(sessionId, query);
+          } catch (err) {
+            return { ok: false, error: String(err) };
+          }
+        };
+
+        const handleRefreshSchema = async () => {
+          try {
+            const { netcattyBridge: bridgeModule } = await import("../infrastructure/services/netcattyBridge");
+            const bridge = bridgeModule.get();
+            if (!bridge?.db) return;
+            const schema = await bridge.db.getSchema(sessionId);
+            if (schema) {
+              setDatabaseSchemas((prev) => ({
+                ...prev,
+                [sessionId]: schema,
+              }));
+            }
+            return schema;
+          } catch (err) {
+            console.error("Failed to refresh schema:", err);
+          }
+        };
+
+        return (
+          <div className="absolute inset-0 z-20 min-w-0 bg-background">
+            <DatabaseSessionPanel
+              session={activeDatabaseSession}
+              config={activeDatabaseConfig}
+              schema={databaseSchemas[sessionId]}
+              onDisconnect={() => handleDatabaseDisconnect(sessionId)}
+              onExecuteQuery={handleExecuteQuery}
+              onRefreshSchema={handleRefreshSchema}
+            />
+          </div>
+        );
+      })()}
+
       {/* Group Details Panel */}
-      {currentSection === "hosts" && isGroupPanelOpen && editingGroupPath && (
+      {!isDatabaseTabActive && currentSection === "hosts" && isGroupPanelOpen && editingGroupPath && (
         <GroupDetailsPanel
           key={editingGroupPath}
           groupPath={editingGroupPath}
@@ -3259,7 +3815,7 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
       )}
 
       {/* Host Details Panel - positioned at VaultView root level for correct top alignment */}
-      {currentSection === "hosts" && isHostPanelOpen && editingHost?.protocol !== 'serial' && (
+      {!isDatabaseTabActive && currentSection === "hosts" && isHostPanelOpen && editingHost?.protocol !== 'serial' && (
         <HostDetailsPanel
           initialData={editingHost}
           availableKeys={keys}
@@ -3298,7 +3854,7 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
         />
       )}
 
-      {currentSection === "databases" && databaseEditingConfig && (
+      {!isDatabaseTabActive && databaseEditingConfig && (
         <DatabaseDetailsPanel
           key={databaseEditingConfig.id ?? "new-database"}
           config={databaseEditingConfig}
@@ -3308,11 +3864,12 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
           onSave={handleDatabaseSaveConfig}
           onTestConnection={handleDatabaseTestConnection}
           availableHosts={hosts.map((host) => ({ id: host.id, label: host.label }))}
+          availableGroups={allGroupPaths}
         />
       )}
 
       {/* Serial Host Details Panel - for editing serial port hosts */}
-      {currentSection === "hosts" && isHostPanelOpen && editingHost?.protocol === 'serial' && (
+      {!isDatabaseTabActive && currentSection === "hosts" && isHostPanelOpen && editingHost?.protocol === 'serial' && (
         <SerialHostDetailsPanel
           initialData={editingHost}
           allTags={allTags}

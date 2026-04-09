@@ -13,6 +13,7 @@ export interface DatabaseConfig {
   id: string;
   label: string;
   driver: DatabaseDriver;
+  group?: string;
   host: string;
   port: number;
   database?: string;
@@ -63,6 +64,7 @@ export interface ConnectionStatus {
  */
 export interface QueryResult {
   columns?: string[];
+  fields?: string[];
   rows?: Record<string, unknown>[];
   rowCount?: number;
   insertId?: number | bigint;
@@ -70,6 +72,10 @@ export interface QueryResult {
   durationMs: number;
   truncated?: boolean;
   error?: string;
+  type?: string;
+  message?: string;
+  affectedRows?: number;
+  warningCount?: number;
   // Redis specific
   result?: unknown;
 }
@@ -81,6 +87,13 @@ export interface DatabaseSchema {
   driver: DatabaseDriver;
   serverVersion: string;
   databases?: string[];
+  keyspaces?: Array<{
+    name: string;
+    keys?: number;
+  }>;
+  sampledKeyTypes?: Record<string, number>;
+  sampledKeyCount?: number;
+  totalKeyCount?: number;
   tables: TableInfo[];
   views: TableInfo[];
   indexes: IndexInfo[];

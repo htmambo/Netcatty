@@ -48,6 +48,7 @@ interface DatabaseDetailsPanelProps {
   onCancel: () => void;
   onTestConnection: (config: DatabaseConfig) => Promise<{ok: boolean; error?: string; latencyMs?: number}>;
   availableHosts?: { id: string; label: string }[];
+  availableGroups?: string[];
 }
 
 const DRIVER_OPTIONS: { value: DatabaseDriver; label: string; defaultPort: number }[] = [
@@ -67,6 +68,7 @@ const DatabaseDetailsPanel: React.FC<DatabaseDetailsPanelProps> = ({
   onCancel,
   onTestConnection,
   availableHosts = [],
+  availableGroups = [],
 }) => {
   const { t } = useI18n();
   const [showPassword, setShowPassword] = useState(false);
@@ -80,6 +82,7 @@ const DatabaseDetailsPanel: React.FC<DatabaseDetailsPanelProps> = ({
     id: "",
     label: "",
     driver: "mysql",
+    group: undefined,
     host: "localhost",
     port: 3306,
     database: "",
@@ -111,6 +114,7 @@ const DatabaseDetailsPanel: React.FC<DatabaseDetailsPanelProps> = ({
         id: crypto.randomUUID(),
         label: "",
         driver: "mysql",
+        group: undefined,
         host: "localhost",
         port: 3306,
         database: "",
@@ -160,6 +164,7 @@ const DatabaseDetailsPanel: React.FC<DatabaseDetailsPanelProps> = ({
       id: form.id || crypto.randomUUID(),
       label: form.label || "",
       driver: form.driver || "mysql",
+      group: form.group,
       host: form.host || "",
       port: form.port || 0,
       database: form.database,
@@ -191,6 +196,7 @@ const DatabaseDetailsPanel: React.FC<DatabaseDetailsPanelProps> = ({
         id: form.id || crypto.randomUUID(),
         label: form.label || "",
         driver: form.driver || "mysql",
+        group: form.group,
         host: form.host || "",
         port: form.port || 0,
         database: form.database,
@@ -259,6 +265,26 @@ const DatabaseDetailsPanel: React.FC<DatabaseDetailsPanelProps> = ({
                   onChange={(e) => update("label", e.target.value)}
                   className="h-10"
                 />
+              </div>
+
+              <div className="space-y-1.5">
+                <Label htmlFor="group">{t("database.group")}</Label>
+                <Select
+                  value={form.group || "__none__"}
+                  onValueChange={(value) => update("group", value === "__none__" ? undefined : value)}
+                >
+                  <SelectTrigger id="group" className="h-10">
+                    <SelectValue placeholder={t("database.selectGroup")} />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="__none__">{t("database.noGroup")}</SelectItem>
+                    {availableGroups.map((groupPath) => (
+                      <SelectItem key={groupPath} value={groupPath}>
+                        {groupPath}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
               </div>
 
               {/* Driver */}

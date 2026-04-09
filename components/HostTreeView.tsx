@@ -1,7 +1,8 @@
-import { CheckSquare, ChevronRight, Edit2, FileSymlink, Folder, FolderOpen, Monitor, Server, Square, Expand, Minimize2 } from 'lucide-react';
+import { CheckSquare, ChevronRight, Database, Edit2, FileSymlink, Folder, FolderOpen, Monitor, Plug, Server, Square, Expand, Minimize2, Trash2 } from 'lucide-react';
 import React, { useMemo } from 'react';
 import { useI18n } from '../application/i18n/I18nProvider';
 import { useTreeExpandedState } from '../application/state/useTreeExpandedState';
+import type { DatabaseConfig } from '../domain/databaseModels';
 import { sanitizeHost } from '../domain/host';
 import { STORAGE_KEY_VAULT_HOSTS_TREE_EXPANDED } from '../infrastructure/config/storageKeys';
 import { cn } from '../lib/utils';
@@ -14,6 +15,7 @@ import { Button } from './ui/button';
 interface HostTreeViewProps {
   groupTree: GroupNode[];
   hosts: Host[];
+  databaseConfigs?: DatabaseConfig[];
   sortMode?: 'az' | 'za' | 'newest' | 'oldest' | 'group';
   expandedPaths?: Set<string>;
   onTogglePath?: (path: string) => void;
@@ -25,9 +27,13 @@ interface HostTreeViewProps {
   onDeleteHost: (host: Host) => void;
   onCopyCredentials: (host: Host) => void;
   onNewHost: (groupPath?: string) => void;
+  onNewDatabase?: (groupPath?: string) => void;
   onNewGroup: (parentPath?: string) => void;
   onEditGroup: (groupPath: string) => void;
   onDeleteGroup: (groupPath: string) => void;
+  onOpenDatabase?: (config: DatabaseConfig) => void;
+  onEditDatabase?: (config: DatabaseConfig) => void;
+  onDeleteDatabase?: (config: DatabaseConfig) => void;
   moveHostToGroup: (hostId: string, groupPath: string | null) => void;
   moveGroup: (sourcePath: string, targetPath: string) => void;
   managedGroupPaths?: Set<string>;
@@ -52,9 +58,13 @@ interface TreeNodeProps {
   onDeleteHost: (host: Host) => void;
   onCopyCredentials: (host: Host) => void;
   onNewHost: (groupPath?: string) => void;
+  onNewDatabase?: (groupPath?: string) => void;
   onNewGroup: (parentPath?: string) => void;
   onEditGroup: (groupPath: string) => void;
   onDeleteGroup: (groupPath: string) => void;
+  onOpenDatabase?: (config: DatabaseConfig) => void;
+  onEditDatabase?: (config: DatabaseConfig) => void;
+  onDeleteDatabase?: (config: DatabaseConfig) => void;
   moveHostToGroup: (hostId: string, groupPath: string | null) => void;
   moveGroup: (sourcePath: string, targetPath: string) => void;
   managedGroupPaths?: Set<string>;
@@ -80,9 +90,13 @@ const TreeNode: React.FC<TreeNodeProps> = ({
   onDeleteHost,
   onCopyCredentials,
   onNewHost,
+  onNewDatabase,
   onNewGroup,
   onEditGroup,
   onDeleteGroup,
+  onOpenDatabase,
+  onEditDatabase,
+  onDeleteDatabase,
   moveHostToGroup,
   moveGroup,
   managedGroupPaths,
@@ -99,7 +113,7 @@ const TreeNode: React.FC<TreeNodeProps> = ({
   const hasChildren = node.children && Object.keys(node.children).length > 0;
   const paddingLeft = `${depth * 20 + 12}px`;
   const isManaged = managedGroupPaths?.has(node.path) ?? false;
-  const hostsCountInNode = node.totalHostCount ?? node.hosts.length;
+  const hostsCountInNode = node.totalItemCount ?? node.totalHostCount ?? node.hosts.length;
 
   const childNodes = useMemo(() => {
     if (!node.children) return [];
@@ -135,6 +149,23 @@ const TreeNode: React.FC<TreeNodeProps> = ({
       }
     });
   }, [node.hosts, sortMode]);
+
+  const sortedDatabaseConfigs = useMemo(() => {
+    return [...(node.databaseConfigs || [])].sort((a, b) => {
+      switch (sortMode) {
+        case 'az':
+          return a.label.localeCompare(b.label);
+        case 'za':
+          return b.label.localeCompare(a.label);
+        case 'newest':
+          return (b.createdAt || 0) - (a.createdAt || 0);
+        case 'oldest':
+          return (a.createdAt || 0) - (b.createdAt || 0);
+        default:
+          return a.label.localeCompare(b.label);
+      }
+    });
+  }, [node.databaseConfigs, sortMode]);
 
   return (
     <div>
@@ -174,7 +205,7 @@ const TreeNode: React.FC<TreeNodeProps> = ({
                 }}
               >
                 <div className="mr-2 flex-shrink-0 w-4 h-4 flex items-center justify-center">
-                  {(hasChildren || node.hosts.length > 0) && (
+                  {(hasChildren || node.hosts.length > 0 || sortedDatabaseConfigs.length > 0) && (
                     <div className={cn("transition-transform duration-200", isExpanded ? "rotate-90" : "")}>
                       <ChevronRight size={14} />
                     </div>
@@ -211,6 +242,11 @@ const TreeNode: React.FC<TreeNodeProps> = ({
             <ContextMenuItem onClick={() => onNewHost(node.path)}>
               <Server className="mr-2 h-4 w-4" /> {t("vault.hosts.newHost")}
             </ContextMenuItem>
+            {onNewDatabase && (
+              <ContextMenuItem onClick={() => onNewDatabase(node.path)}>
+                <Database className="mr-2 h-4 w-4" /> {t("database.addDatabase")}
+              </ContextMenuItem>
+            )}
             <ContextMenuItem onClick={() => onNewGroup(node.path)}>
               <Folder className="mr-2 h-4 w-4" /> {t("vault.hosts.newGroup")}
             </ContextMenuItem>
@@ -247,9 +283,13 @@ const TreeNode: React.FC<TreeNodeProps> = ({
               onDeleteHost={onDeleteHost}
               onCopyCredentials={onCopyCredentials}
               onNewHost={onNewHost}
+              onNewDatabase={onNewDatabase}
               onNewGroup={onNewGroup}
               onEditGroup={onEditGroup}
               onDeleteGroup={onDeleteGroup}
+              onOpenDatabase={onOpenDatabase}
+              onEditDatabase={onEditDatabase}
+              onDeleteDatabase={onDeleteDatabase}
               moveHostToGroup={moveHostToGroup}
               moveGroup={moveGroup}
               managedGroupPaths={managedGroupPaths}
@@ -281,9 +321,92 @@ const TreeNode: React.FC<TreeNodeProps> = ({
               toggleHostSelection={toggleHostSelection}
             />
           ))}
+          {sortedDatabaseConfigs.map((config) => (
+            <DatabaseTreeItem
+              key={config.id}
+              config={config}
+              depth={depth + 1}
+              onOpenDatabase={onOpenDatabase}
+              onEditDatabase={onEditDatabase}
+              onDeleteDatabase={onDeleteDatabase}
+            />
+          ))}
         </CollapsibleContent>
       </Collapsible>
     </div>
+  );
+};
+
+interface DatabaseTreeItemProps {
+  config: DatabaseConfig;
+  depth: number;
+  onOpenDatabase?: (config: DatabaseConfig) => void;
+  onEditDatabase?: (config: DatabaseConfig) => void;
+  onDeleteDatabase?: (config: DatabaseConfig) => void;
+}
+
+const DatabaseTreeItem: React.FC<DatabaseTreeItemProps> = ({
+  config,
+  depth,
+  onOpenDatabase,
+  onEditDatabase,
+  onDeleteDatabase,
+}) => {
+  const { t } = useI18n();
+  const paddingLeft = `${depth * 20 + 12}px`;
+  const subtitle = config.driver === 'sqlite'
+    ? (config.filePath || '')
+    : `${config.username || '-'}@${config.host || 'localhost'}${config.port ? `:${config.port}` : ''}`;
+
+  return (
+    <ContextMenu>
+      <ContextMenuTrigger>
+        <div
+          className="flex items-center py-2 pr-3 text-sm cursor-pointer transition-colors select-none group hover:bg-secondary/40 rounded-lg"
+          style={{ paddingLeft }}
+          onClick={() => onOpenDatabase?.(config)}
+        >
+          <div className="mr-2 flex-shrink-0 w-4 h-4" />
+          <div className="mr-3 flex-shrink-0 h-7 w-7 rounded-lg bg-[#44779F]/12 text-[#44779F] flex items-center justify-center">
+            <Database size={14} />
+          </div>
+          <div className="flex-1 min-w-0">
+            <div className="font-medium truncate">{config.label}</div>
+            <div className="text-xs text-muted-foreground truncate">
+              {subtitle}
+            </div>
+          </div>
+          <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
+            <span className="text-xs px-1.5 py-0.5 bg-primary/10 text-primary rounded">
+              {config.driver.toUpperCase()}
+            </span>
+            <button
+              className="h-7 w-7 flex items-center justify-center rounded-md hover:bg-secondary/80 transition-colors"
+              onClick={(e) => {
+                e.stopPropagation();
+                onEditDatabase?.(config);
+              }}
+            >
+              <Edit2 size={13} />
+            </button>
+          </div>
+        </div>
+      </ContextMenuTrigger>
+      <ContextMenuContent>
+        <ContextMenuItem onClick={() => onOpenDatabase?.(config)}>
+          <Plug className="mr-2 h-4 w-4" /> {t("action.open")}
+        </ContextMenuItem>
+        <ContextMenuItem onClick={() => onEditDatabase?.(config)}>
+          <Edit2 className="mr-2 h-4 w-4" /> {t("action.edit")}
+        </ContextMenuItem>
+        <ContextMenuItem
+          onClick={() => onDeleteDatabase?.(config)}
+          className="text-destructive focus:text-destructive"
+        >
+          <Trash2 className="mr-2 h-4 w-4" /> {t("action.delete")}
+        </ContextMenuItem>
+      </ContextMenuContent>
+    </ContextMenu>
   );
 };
 
@@ -421,6 +544,7 @@ const HostTreeItem: React.FC<HostTreeItemProps> = ({
 export const HostTreeView: React.FC<HostTreeViewProps> = ({
   groupTree,
   hosts,
+  databaseConfigs = [],
   sortMode = 'az',
   expandedPaths: externalExpandedPaths,
   onTogglePath: externalOnTogglePath,
@@ -432,9 +556,13 @@ export const HostTreeView: React.FC<HostTreeViewProps> = ({
   onDeleteHost,
   onCopyCredentials,
   onNewHost,
+  onNewDatabase,
   onNewGroup,
   onEditGroup,
   onDeleteGroup,
+  onOpenDatabase,
+  onEditDatabase,
+  onDeleteDatabase,
   moveHostToGroup,
   moveGroup,
   managedGroupPaths,
@@ -500,6 +628,24 @@ export const HostTreeView: React.FC<HostTreeViewProps> = ({
     });
   }, [hosts, sortMode]);
 
+  const ungroupedDatabaseConfigs = useMemo(() => {
+    const configsWithoutGroup = databaseConfigs.filter(config => !config.group || config.group === '');
+    return configsWithoutGroup.sort((a, b) => {
+      switch (sortMode) {
+        case 'az':
+          return a.label.localeCompare(b.label);
+        case 'za':
+          return b.label.localeCompare(a.label);
+        case 'newest':
+          return (b.createdAt || 0) - (a.createdAt || 0);
+        case 'oldest':
+          return (a.createdAt || 0) - (b.createdAt || 0);
+        default:
+          return a.label.localeCompare(b.label);
+      }
+    });
+  }, [databaseConfigs, sortMode]);
+
   // Sort group tree based on sort mode
   const sortedGroupTree = useMemo(() => {
     return [...groupTree].sort((a, b) => {
@@ -558,9 +704,13 @@ export const HostTreeView: React.FC<HostTreeViewProps> = ({
           onDeleteHost={onDeleteHost}
           onCopyCredentials={onCopyCredentials}
           onNewHost={onNewHost}
+          onNewDatabase={onNewDatabase}
           onNewGroup={onNewGroup}
           onEditGroup={onEditGroup}
           onDeleteGroup={onDeleteGroup}
+          onOpenDatabase={onOpenDatabase}
+          onEditDatabase={onEditDatabase}
+          onDeleteDatabase={onDeleteDatabase}
           moveHostToGroup={moveHostToGroup}
           moveGroup={moveGroup}
           managedGroupPaths={managedGroupPaths}
@@ -590,9 +740,19 @@ export const HostTreeView: React.FC<HostTreeViewProps> = ({
           toggleHostSelection={toggleHostSelection}
         />
       ))}
+      {ungroupedDatabaseConfigs.map((config) => (
+        <DatabaseTreeItem
+          key={config.id}
+          config={config}
+          depth={0}
+          onOpenDatabase={onOpenDatabase}
+          onEditDatabase={onEditDatabase}
+          onDeleteDatabase={onDeleteDatabase}
+        />
+      ))}
       
       {/* Empty state */}
-      {ungroupedHosts.length === 0 && groupTree.length === 0 && (
+      {ungroupedHosts.length === 0 && ungroupedDatabaseConfigs.length === 0 && groupTree.length === 0 && (
         <div className="text-center py-12 text-muted-foreground">
           <Server size={48} className="mx-auto mb-4 opacity-50" />
           <p className="text-sm">{t("vault.hosts.empty")}</p>

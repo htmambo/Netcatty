@@ -73,6 +73,9 @@ export const useIsSftpActive = () => {
 // Check if terminal layer should be visible
 export const useIsTerminalLayerVisible = (draggingSessionId: string | null) => {
   const activeTabId = useActiveTabId();
-  const isTerminalTab = activeTabId !== 'vault' && activeTabId !== 'sftp';
+  const isTerminalTab =
+    activeTabId !== 'vault' &&
+    activeTabId !== 'sftp' &&
+    !activeTabId.startsWith('database:');
   return isTerminalTab || !!draggingSessionId;
 };

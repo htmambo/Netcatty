@@ -1,5 +1,5 @@
 import React, { Suspense, lazy, useCallback, useEffect, useEffectEvent, useMemo, useRef, useState } from 'react';
-import { activeTabStore, useActiveTabId, useIsSftpActive, useIsTerminalLayerVisible, useIsVaultActive } from './application/state/activeTabStore';
+import { activeTabStore, useActiveTabId, useIsSftpActive, useIsTerminalLayerVisible } from './application/state/activeTabStore';
 import { useAutoSync } from './application/state/useAutoSync';
 import { useImmersiveMode } from './application/state/useImmersiveMode';
 import { useManagedSourceSync } from './application/state/useManagedSourceSync';
@@ -48,13 +48,14 @@ initializeUIFonts();
 
 // Visibility container for VaultView - isolates isActive subscription
 const VaultViewContainer: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const isActive = useIsVaultActive();
-  const containerStyle: React.CSSProperties = isActive
+  const activeTabId = useActiveTabId();
+  const isVisible = activeTabId === 'vault' || activeTabId.startsWith('database:');
+  const containerStyle: React.CSSProperties = isVisible
     ? {}
     : { visibility: 'hidden', pointerEvents: 'none', position: 'absolute', zIndex: -1 };
 
   return (
-    <div className={cn("absolute inset-0", isActive ? "z-20" : "")} style={containerStyle}>
+    <div className={cn("absolute inset-0", isVisible ? "z-20" : "")} style={containerStyle}>
       {children}
     </div>
   );
@@ -178,6 +179,9 @@ function App({ settings }: { settings: SettingsState }) {
   // Database sessions for TopTabs routing
   const [databaseSessions, setDatabaseSessions] = useState<import('./domain/databaseModels').DatabaseSession[]>([]);
   const handleCloseDatabaseSession = useCallback((sessionId: string) => {
+    if (activeTabStore.getActiveTabId() === `database:${sessionId}`) {
+      activeTabStore.setActiveTabId('vault');
+    }
     setDatabaseSessions(prev => prev.filter(s => s.id !== sessionId));
   }, []);
 
@@ -328,7 +332,7 @@ function App({ settings }: { settings: SettingsState }) {
     [customThemes],
   );
   const activeTerminalTheme = useMemo<TerminalTheme | null>(() => {
-    if (activeTabId === 'vault' || activeTabId === 'sftp') return null;
+    if (activeTabId === 'vault' || activeTabId === 'sftp' || activeTabId.startsWith('database:')) return null;
 
     const resolveTheme = (s: TerminalSession): TerminalTheme => {
       const host = hostById.get(s.hostId) ?? null;
@@ -1452,6 +1456,7 @@ function App({ settings }: { settings: SettingsState }) {
             onClearUnsavedConnectionLogs={clearUnsavedConnectionLogs}
             onRunSnippet={runSnippet}
             onOpenLogView={openLogView}
+            onDatabaseSessionsChange={setDatabaseSessions}
             navigateToSection={navigateToSection}
             onNavigateToSectionHandled={() => setNavigateToSection(null)}
           />

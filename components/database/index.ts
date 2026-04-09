@@ -1,4 +1,3 @@
-export { default as DatabaseView } from "./DatabaseView";
 export { default as DatabaseDetailsPanel } from "./DatabaseDetailsPanel";
 export { default as DatabaseSessionPanel } from "./DatabaseSessionPanel";
 export { default as DatabaseResultsTable } from "./DatabaseResultsTable";

@@ -1,398 +1,286 @@
 import {
   ChevronRight,
-  Circle,
+  Copy,
   Database,
   FileText,
   Hash,
-  Key,
   Server,
   Table,
-  Type,
+  Wrench,
 } from "lucide-react";
-import React, { useCallback, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { useI18n } from "../../application/i18n/I18nProvider";
-import { cn } from "../../lib/utils";
+import type {
+  DatabaseExplorerNode,
+  DatabaseObjectSelection,
+} from "../../domain/databaseSchemaView";
 import {
-  ColumnInfo,
-  DatabaseDriver,
-  DatabaseSchema,
-  TableInfo,
-} from "../../domain/databaseModels";
+  buildDatabaseExplorerSections,
+  buildQueryTemplateForSelection,
+  normalizeDatabaseSchema,
+} from "../../domain/databaseSchemaView";
+import { cn } from "../../lib/utils";
 import {
   Collapsible,
   CollapsibleContent,
   CollapsibleTrigger,
 } from "../ui/collapsible";
-import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuTrigger } from "../ui/context-menu";
-import { TooltipProvider } from "../ui/tooltip";
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuTrigger,
+} from "../ui/context-menu";
 
 interface DatabaseSchemaTreeProps {
-  schema: DatabaseSchema;
+  schema: unknown;
   searchQuery?: string;
-  onSelectTable: (tableName: string) => void;
-  onRefresh: () => void;
+  selectedObjectId?: string | null;
+  onOpenObject: (selection: DatabaseObjectSelection) => void;
+  onOpenQuery: (selection: DatabaseObjectSelection) => void;
 }
 
-// Get column icon based on data type
-const getColumnIcon = (column: ColumnInfo): React.ReactNode => {
-  const type = column.dataType.toLowerCase();
-
-  if (column.primaryKey) {
-    return <Key size={12} className="text-yellow-500" />;
+const getNodeIcon = (kind: DatabaseExplorerNode["kind"]): React.ReactNode => {
+  switch (kind) {
+    case "schema":
+      return <Server size={12} className="text-muted-foreground" />;
+    case "table":
+      return <Table size={12} className="text-[#44779F]" />;
+    case "view":
+      return <FileText size={12} className="text-sky-500" />;
+    case "collection":
+      return <Database size={12} className="text-[#47A248]" />;
+    case "redis-type":
+      return <Hash size={12} className="text-[#DC382D]" />;
+    case "extension":
+      return <Wrench size={12} className="text-amber-500" />;
+    default:
+      return <Database size={12} className="text-muted-foreground" />;
   }
-
-  if (type.includes("int") || type.includes("float") || type.includes("decimal") || type.includes("numeric")) {
-    return <Hash size={12} className="text-blue-400" />;
-  }
-
-  if (type.includes("text") || type.includes("char") || type.includes("varchar") || type.includes("string")) {
-    return <Type size={12} className="text-green-400" />;
-  }
-
-  if (type.includes("date") || type.includes("time") || type.includes("timestamp")) {
-    return <Circle size={12} className="text-purple-400" />;
-  }
-
-  if (type.includes("bool")) {
-    return <Circle size={12} className="text-orange-400" />;
-  }
-
-  if (type.includes("json") || type.includes("xml") || type.includes("blob") || type.includes("binary")) {
-    return <FileText size={12} className="text-gray-400" />;
-  }
-
-  return <Circle size={12} className="text-muted-foreground" />;
 };
 
-// Get driver-specific icons
-const getDriverIcon = (driver: DatabaseDriver): React.ReactNode => {
-  switch (driver) {
-    case "mysql":
-      return <Database size={14} className="text-[#44779F]" />;
-    case "postgresql":
-      return <Database size={14} className="text-[#336791]" />;
-    case "sqlite":
-      return <Database size={14} className="text-[#003B80]" />;
-    case "redis":
-      return <Server size={14} className="text-[#DC382D]" />;
-    case "mongodb":
-      return <Database size={14} className="text-[#47A248]" />;
-    default:
-      return <Database size={14} className="text-muted-foreground" />;
+const buildSelectionFromNode = (
+  node: DatabaseExplorerNode,
+): DatabaseObjectSelection | null => {
+  if (node.kind === "overview" || node.kind === "schema" || node.kind === "extension") {
+    return null;
   }
+
+  return {
+    id: node.id,
+    kind: node.kind,
+    label: node.label,
+    name: node.name,
+    schemaName: node.schemaName,
+  };
 };
 
 const DatabaseSchemaTree: React.FC<DatabaseSchemaTreeProps> = ({
   schema,
   searchQuery = "",
-  onSelectTable,
-  onRefresh: _onRefresh,
+  selectedObjectId,
+  onOpenObject,
+  onOpenQuery,
 }) => {
   const { t } = useI18n();
-  const [expandedTables, setExpandedTables] = useState<Set<string>>(new Set());
-  const [expandedSchemas, setExpandedSchemas] = useState<Set<string>>(new Set(["default"]));
+  const normalizedSchema = useMemo(() => normalizeDatabaseSchema(schema), [schema]);
+  const explorerSections = useMemo(
+    () => buildDatabaseExplorerSections(schema, searchQuery),
+    [schema, searchQuery],
+  );
+  const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
 
-  // Filter by search query
-  const filteredTables = useMemo(() => {
-    if (!searchQuery.trim()) return schema.tables;
-    const query = searchQuery.toLowerCase();
-    return schema.tables.filter(
-      (table) =>
-        table.name.toLowerCase().includes(query) ||
-        table.columns.some((col) => col.name.toLowerCase().includes(query))
-    );
-  }, [schema.tables, searchQuery]);
+  useEffect(() => {
+    setExpandedIds((prev) => {
+      if (prev.size > 0) return prev;
 
-  // Group tables by schema
-  const tablesBySchema = useMemo(() => {
-    const groups: Record<string, TableInfo[]> = {};
-    for (const table of filteredTables) {
-      const schemaName = table.schema || "default";
-      if (!groups[schemaName]) groups[schemaName] = [];
-      groups[schemaName].push(table);
-    }
-    // Sort schemas
-    const schemaNames = Object.keys(groups).sort();
-    return schemaNames.map((name) => ({
-      name,
-      tables: groups[name].sort((a, b) => a.name.localeCompare(b.name)),
-    }));
-  }, [filteredTables]);
+      const next = new Set<string>();
+      explorerSections.forEach((section) => {
+        next.add(section.id);
+        section.items.forEach((item) => {
+          if (item.kind === "schema") {
+            next.add(item.id);
+          }
+        });
+      });
+      return next;
+    });
+  }, [explorerSections]);
 
-  // Toggle table expansion
-  const toggleTable = useCallback((tableName: string) => {
-    setExpandedTables((prev) => {
+  const toggleExpanded = useCallback((id: string) => {
+    setExpandedIds((prev) => {
       const next = new Set(prev);
-      if (next.has(tableName)) {
-        next.delete(tableName);
+      if (next.has(id)) {
+        next.delete(id);
       } else {
-        next.add(tableName);
+        next.add(id);
       }
       return next;
     });
   }, []);
 
-  // Toggle schema expansion
-  const toggleSchema = useCallback((schemaName: string) => {
-    setExpandedSchemas((prev) => {
-      const next = new Set(prev);
-      if (next.has(schemaName)) {
-        next.delete(schemaName);
-      } else {
-        next.add(schemaName);
-      }
-      return next;
-    });
-  }, []);
-
-  // Generate SELECT query for table
-  const generateSelectQuery = useCallback(
-    (table: TableInfo): string => {
-      const columns = table.columns.map((c) => c.name).join(", ");
-      const whereClause = table.columns
-        .filter((c) => c.primaryKey)
-        .map((c) => `${c.name} = ?`)
-        .join(" AND ");
-
-      let query = `SELECT ${columns}\nFROM ${table.schema ? `${table.schema}.` : ""}${table.name}`;
-      if (whereClause) {
-        query += `\nWHERE ${whereClause}`;
-      }
-      query += ";";
-      return query;
+  const copyPreviewQuery = useCallback(
+    (selection: DatabaseObjectSelection) => {
+      const template = buildQueryTemplateForSelection(
+        selection,
+        schema,
+        normalizedSchema.driver,
+      );
+      if (!template) return;
+      navigator.clipboard.writeText(template.query);
     },
-    []
+    [normalizedSchema.driver, schema],
   );
 
-  // Generate INSERT query for table
-  const generateInsertQuery = useCallback((table: TableInfo): string => {
-    const columns = table.columns.filter((c) => !c.primaryKey || c.defaultValue !== undefined);
-    const columnNames = columns.map((c) => c.name).join(", ");
-    const placeholders = columns.map(() => "?").join(", ");
-    return `INSERT INTO ${table.schema ? `${table.schema}.` : ""}${table.name} (${columnNames})\nVALUES (${placeholders});`;
-  }, []);
+  const renderNode = useCallback(
+    (node: DatabaseExplorerNode, depth = 0): React.ReactNode => {
+      const selection = buildSelectionFromNode(node);
+      const hasChildren = Array.isArray(node.children) && node.children.length > 0;
+      const isExpanded = expandedIds.has(node.id);
+      const paddingLeft = 10 + depth * 16;
+      const template = selection
+        ? buildQueryTemplateForSelection(selection, schema, normalizedSchema.driver)
+        : null;
 
-  return (
-    <div className="py-1">
-      <TooltipProvider>
-        {/* Schema/Server info */}
-        <div className="px-2 py-1.5 mb-1 border-b border-border/40">
-          <div className="flex items-center gap-2 text-xs">
-            {getDriverIcon(schema.driver)}
-            <span className="text-muted-foreground truncate">
-              {schema.serverVersion}
-            </span>
-          </div>
-        </div>
-
-        {/* Tables by schema */}
-        {tablesBySchema.map(({ name: schemaName, tables }) => (
+      if (hasChildren) {
+        return (
           <Collapsible
-            key={schemaName}
-            open={expandedSchemas.has(schemaName)}
-            onOpenChange={() => toggleSchema(schemaName)}
+            key={node.id}
+            open={isExpanded}
+            onOpenChange={() => toggleExpanded(node.id)}
           >
             <CollapsibleTrigger asChild>
-              <div className="flex items-center gap-1 px-2 py-1 text-xs font-medium text-muted-foreground hover:bg-muted/50 cursor-pointer rounded-sm transition-colors">
+              <button
+                type="button"
+                className="flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-xs text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground"
+                style={{ paddingLeft: `${paddingLeft}px` }}
+              >
                 <ChevronRight
                   size={12}
-                  className={cn(
-                    "transition-transform",
-                    expandedSchemas.has(schemaName) && "rotate-90"
-                  )}
+                  className={cn("shrink-0 transition-transform", isExpanded && "rotate-90")}
                 />
-                <Server size={12} />
+                {getNodeIcon(node.kind)}
                 <span className="truncate">
-                  {schemaName === "default" ? t("database.tables") : schemaName}
+                  {node.label === "default" ? t("database.defaultSchema") : node.label}
                 </span>
-                <span className="ml-auto text-muted-foreground/60">
-                  {tables.length}
-                </span>
-              </div>
+                {typeof node.count === "number" && (
+                  <span className="ml-auto shrink-0 text-[10px] text-muted-foreground/80">
+                    {node.count}
+                  </span>
+                )}
+              </button>
             </CollapsibleTrigger>
             <CollapsibleContent>
-              {tables.map((table) => (
-                <TableNode
-                  key={table.name}
-                  table={table}
-                  expanded={expandedTables.has(table.name)}
-                  onToggle={() => toggleTable(table.name)}
-                  onSelect={() => onSelectTable(table.name)}
-                  onGenerateSelect={() => {
-                    navigator.clipboard.writeText(generateSelectQuery(table));
-                  }}
-                  onGenerateInsert={() => {
-                    navigator.clipboard.writeText(generateInsertQuery(table));
-                  }}
-                  onCopyName={() => {
-                    navigator.clipboard.writeText(table.name);
-                  }}
-                />
-              ))}
+              <div className="space-y-0.5 py-0.5">
+                {node.children?.map((child) => renderNode(child, depth + 1))}
+              </div>
             </CollapsibleContent>
           </Collapsible>
-        ))}
+        );
+      }
 
-        {/* Views */}
-        {schema.views && schema.views.length > 0 && (
-          <Collapsible>
-            <CollapsibleTrigger asChild>
-              <div className="flex items-center gap-1 px-2 py-1 text-xs font-medium text-muted-foreground hover:bg-muted/50 cursor-pointer rounded-sm transition-colors">
-                <ChevronRight size={12} />
-                <FileText size={12} />
-                <span className="truncate">{t("database.views")}</span>
-                <span className="ml-auto text-muted-foreground/60">
-                  {schema.views.length}
-                </span>
-              </div>
-            </CollapsibleTrigger>
-          </Collapsible>
-        )}
-
-        {/* Collections (MongoDB) */}
-        {schema.collections && schema.collections.length > 0 && (
-          <Collapsible>
-            <CollapsibleTrigger asChild>
-              <div className="flex items-center gap-1 px-2 py-1 text-xs font-medium text-muted-foreground hover:bg-muted/50 cursor-pointer rounded-sm transition-colors">
-                <ChevronRight size={12} />
-                <Database size={12} />
-                <span className="truncate">{t("database.collections")}</span>
-                <span className="ml-auto text-muted-foreground/60">
-                  {schema.collections.length}
-                </span>
-              </div>
-            </CollapsibleTrigger>
-          </Collapsible>
-        )}
-
-        {/* Extensions */}
-        {schema.extensions && schema.extensions.length > 0 && (
-          <div className="px-2 py-1 mt-2 border-t border-border/40">
-            <div className="text-xs text-muted-foreground mb-1">
-              {t("database.extensions")}
-            </div>
-            <div className="flex flex-wrap gap-1">
-              {schema.extensions.map((ext) => (
-                <span
-                  key={ext}
-                  className="px-1.5 py-0.5 bg-muted/50 rounded text-[10px] text-muted-foreground"
-                >
-                  {ext}
-                </span>
-              ))}
-            </div>
-          </div>
-        )}
-
-        {/* Empty state */}
-        {filteredTables.length === 0 && searchQuery && (
-          <div className="px-3 py-4 text-center text-xs text-muted-foreground">
-            {t("database.noTablesFound")}
-          </div>
-        )}
-      </TooltipProvider>
-    </div>
-  );
-};
-
-// Table node component
-interface TableNodeProps {
-  table: TableInfo;
-  expanded: boolean;
-  onToggle: () => void;
-  onSelect: () => void;
-  onGenerateSelect: () => void;
-  onGenerateInsert: () => void;
-  onCopyName: () => void;
-}
-
-const TableNode: React.FC<TableNodeProps> = ({
-  table,
-  expanded,
-  onToggle,
-  onSelect,
-  onGenerateSelect,
-  onGenerateInsert,
-  onCopyName,
-}) => {
-  const { t } = useI18n();
-
-  const primaryKeys = table.columns.filter((c) => c.primaryKey);
-  const regularColumns = table.columns.filter((c) => !c.primaryKey);
-
-  return (
-    <ContextMenu>
-      <ContextMenuTrigger>
-        <Collapsible open={expanded} onOpenChange={onToggle}>
-          <CollapsibleTrigger asChild>
-            <div
-              className="flex items-center gap-1 px-2 py-0.5 pl-6 text-xs hover:bg-muted/50 cursor-pointer rounded-sm transition-colors"
-              onDoubleClick={onSelect}
+      return (
+        <ContextMenu key={node.id}>
+          <ContextMenuTrigger asChild>
+            <button
+              type="button"
+              className={cn(
+                "flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-xs transition-colors hover:bg-muted/60",
+                selectedObjectId === node.id
+                  ? "bg-primary/10 text-foreground"
+                  : "text-muted-foreground hover:text-foreground",
+              )}
+              style={{ paddingLeft: `${paddingLeft + 16}px` }}
+              onClick={() => {
+                if (selection) {
+                  onOpenObject(selection);
+                }
+              }}
             >
-              <ChevronRight
-                size={10}
-                className={cn(
-                  "transition-transform shrink-0",
-                  expanded && "rotate-90"
-                )}
-              />
-              <Table size={12} className="text-blue-400 shrink-0" />
-              <span className="truncate">{table.name}</span>
-              {table.rowCountEstimate !== undefined && (
-                <span className="ml-auto text-muted-foreground/60 text-[10px]">
-                  {table.rowCountEstimate.toLocaleString()}
+              {getNodeIcon(node.kind)}
+              <span className="truncate">{node.label}</span>
+              {node.secondary && (
+                <span className="ml-auto shrink-0 text-[10px] text-muted-foreground/80">
+                  {node.secondary}
                 </span>
               )}
-            </div>
-          </CollapsibleTrigger>
-          <CollapsibleContent>
-            {/* Primary key columns first */}
-            {primaryKeys.map((column) => (
-              <ColumnNode key={column.name} column={column} />
-            ))}
-            {/* Regular columns */}
-            {regularColumns.map((column) => (
-              <ColumnNode key={column.name} column={column} />
-            ))}
-          </CollapsibleContent>
-        </Collapsible>
-      </ContextMenuTrigger>
-      <ContextMenuContent>
-        <ContextMenuItem onClick={onSelect}>
-          <Table size={12} className="mr-2" />
-          {t("database.selectFromTable")}
-        </ContextMenuItem>
-        <ContextMenuItem onClick={onGenerateSelect}>
-          <FileText size={12} className="mr-2" />
-          {t("database.copySelect")}
-        </ContextMenuItem>
-        <ContextMenuItem onClick={onGenerateInsert}>
-          <FileText size={12} className="mr-2" />
-          {t("database.copyInsert")}
-        </ContextMenuItem>
-        <ContextMenuItem onClick={onCopyName}>
-          <FileText size={12} className="mr-2" />
-          {t("database.copyTableName")}
-        </ContextMenuItem>
-      </ContextMenuContent>
-    </ContextMenu>
+            </button>
+          </ContextMenuTrigger>
+          <ContextMenuContent>
+            {selection && (
+              <ContextMenuItem onClick={() => onOpenObject(selection)}>
+                <Table size={12} className="mr-2" />
+                {t("database.previewData")}
+              </ContextMenuItem>
+            )}
+            {selection && (
+              <ContextMenuItem onClick={() => onOpenQuery(selection)}>
+                <FileText size={12} className="mr-2" />
+                {t("database.openInQuery")}
+              </ContextMenuItem>
+            )}
+            {selection && template && (
+              <ContextMenuItem onClick={() => copyPreviewQuery(selection)}>
+                <Copy size={12} className="mr-2" />
+                {t("database.copyPreviewQuery")}
+              </ContextMenuItem>
+            )}
+            <ContextMenuItem
+              onClick={() => navigator.clipboard.writeText(node.name || node.label)}
+            >
+              <Copy size={12} className="mr-2" />
+              {t("database.copyObjectName")}
+            </ContextMenuItem>
+          </ContextMenuContent>
+        </ContextMenu>
+      );
+    },
+    [
+      copyPreviewQuery,
+      expandedIds,
+      normalizedSchema.driver,
+      onOpenObject,
+      onOpenQuery,
+      schema,
+      selectedObjectId,
+      t,
+      toggleExpanded,
+    ],
   );
-};
 
-// Column node component
-interface ColumnNodeProps {
-  column: ColumnInfo;
-}
-
-const ColumnNode: React.FC<ColumnNodeProps> = ({ column }) => {
   return (
-    <div className="flex items-center gap-1 px-2 py-0.5 pl-12 text-[11px] text-muted-foreground/80 hover:text-foreground">
-      {getColumnIcon(column)}
-      <span className="truncate">{column.name}</span>
-      <span className="text-muted-foreground/50 truncate ml-1">
-        {column.dataType}
-        {column.nullable && "?"}
-      </span>
+    <div className="space-y-3 px-2 py-2">
+      <div className="rounded-lg border border-border/60 bg-muted/20 px-2.5 py-2">
+        <div className="flex items-center gap-2 text-xs font-medium">
+          <Database size={13} className="text-muted-foreground" />
+          <span>{normalizedSchema.driver.toUpperCase()}</span>
+        </div>
+        <div className="mt-1 text-[11px] text-muted-foreground">
+          {normalizedSchema.serverVersion}
+        </div>
+      </div>
+
+      {explorerSections.length > 0 ? (
+        <div className="space-y-2">
+          {explorerSections.map((section) => (
+            <div key={section.id} className="space-y-1">
+              <div className="flex items-center gap-2 px-2 text-[10px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
+                <span>{t(`database.${section.label}`)}</span>
+                <span className="rounded bg-muted px-1.5 py-0.5 normal-case tracking-normal text-[10px]">
+                  {section.count}
+                </span>
+              </div>
+              <div className="space-y-0.5">{section.items.map((item) => renderNode(item))}</div>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="rounded-lg border border-dashed border-border/60 px-3 py-4 text-center text-xs text-muted-foreground">
+          {searchQuery.trim()
+            ? t("database.noObjectsFound")
+            : t("database.noObjectsAvailable")}
+        </div>
+      )}
     </div>
   );
 };

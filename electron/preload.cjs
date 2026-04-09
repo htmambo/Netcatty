@@ -1,5 +1,6 @@
 const { ipcRenderer, contextBridge, webUtils } = require("electron");
 const os = require("node:os");
+const { buildExecutePayload } = require("./bridges/database/executePayload.cjs");
 
 const dataListeners = new Map();
 const exitListeners = new Map();
@@ -1351,7 +1352,8 @@ const api = {
     getStatus: (sessionId) => ipcRenderer.invoke("netcatty:db:getStatus", { sessionId }),
 
     // Query Execution
-    execute: (sessionId, query, params) => ipcRenderer.invoke("netcatty:db:execute", { sessionId, query, params }),
+    execute: (sessionId, queryOrCommand, params) =>
+      ipcRenderer.invoke("netcatty:db:execute", buildExecutePayload(sessionId, queryOrCommand, params)),
 
     // Schema
     getSchema: (sessionId) => ipcRenderer.invoke("netcatty:db:getSchema", { sessionId }),

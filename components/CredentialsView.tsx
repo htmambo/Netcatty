@@ -59,7 +59,7 @@ export const CredentialsView: React.FC<CredentialsViewProps> = ({
 
   const handleSave = useCallback(async () => {
     if (!formData.label.trim()) {
-      toast.error("Label is required");
+      toast.error(t("vault.credentials.labelRequired"));
       return;
     }
 
@@ -72,24 +72,32 @@ export const CredentialsView: React.FC<CredentialsViewProps> = ({
       updatedAt: Date.now(),
     };
 
-    await onSave(credential);
-    resetForm();
-  }, [formData, editingId, credentials, onSave, resetForm]);
+    try {
+      await onSave(credential);
+      resetForm();
+    } catch {
+      // Error toast is handled by the caller so the form can stay open for correction.
+    }
+  }, [formData, editingId, credentials, onSave, resetForm, t]);
 
   const handleDelete = useCallback(async (id: string) => {
-    await onDelete(id);
+    try {
+      await onDelete(id);
+    } catch {
+      // Error toast is handled by the caller.
+    }
   }, [onDelete]);
 
   const handleCopyPassword = useCallback(async (cred: GenericCredential) => {
     try {
       await navigator.clipboard.writeText(cred.password);
       setCopiedId(cred.id);
-      toast.success("Password copied to clipboard");
+      toast.success(t("vault.credentials.passwordCopied"));
       setTimeout(() => setCopiedId(null), 2000);
     } catch {
-      toast.error("Failed to copy password");
+      toast.error(t("vault.credentials.copyPasswordFailed"));
     }
-  }, []);
+  }, [t]);
 
   const maskPassword = (password: string) => {
     return "*".repeat(Math.min(password.length, 12));

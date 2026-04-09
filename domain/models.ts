@@ -1,3 +1,5 @@
+import type { DatabaseConfig } from './databaseModels';
+
 // Proxy configuration for SSH connections
 type ProxyType = 'http' | 'socks5';
 // UI locale identifier, stored in settings and used for i18n (e.g., "en", "zh-CN").
@@ -187,8 +189,11 @@ export interface GroupNode {
   path: string;
   children: Record<string, GroupNode>;
   hosts: Host[];
+  databaseConfigs?: DatabaseConfig[];
   /** Pre-computed total host count including all descendants. Set during tree construction. */
   totalHostCount?: number;
+  /** Pre-computed total connection count including all descendants. */
+  totalItemCount?: number;
 }
 
 /** Default configuration for a group. Hosts in this group inherit these values when not explicitly set. */
