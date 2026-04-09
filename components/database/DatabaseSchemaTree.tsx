@@ -120,6 +120,8 @@ const DatabaseSchemaTree: React.FC<DatabaseSchemaTreeProps> = ({
       const next = new Set(prev);
       let changed = false;
 
+      // Only auto-expand section-level IDs (always-visible category headers).
+      // Do NOT re-add schema node IDs — users may have intentionally collapsed them.
       explorerSections.forEach((section) => {
         if (!next.has(section.id)) {
           next.add(section.id);
@@ -127,19 +129,9 @@ const DatabaseSchemaTree: React.FC<DatabaseSchemaTreeProps> = ({
         }
       });
 
-      if (prev.size === 0 || loadingSchemaNames.length > 0) {
-        const ensured = collectInitialExpandedIds(explorerSections, loadingSchemaNames);
-        ensured.forEach((id) => {
-          if (!next.has(id)) {
-            next.add(id);
-            changed = true;
-          }
-        });
-      }
-
       return changed ? next : prev;
     });
-  }, [explorerSections, loadingSchemaNames]);
+  }, [explorerSections]);
 
   const setExpanded = useCallback((id: string, open: boolean) => {
     setExpandedIds((prev) => {
