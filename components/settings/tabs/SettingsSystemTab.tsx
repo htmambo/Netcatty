@@ -44,6 +44,8 @@ interface TempDirInfo {
   totalSize: number;
 }
 
+const GPU_USE_ANGLE_DEFAULT = "__default__";
+
 function formatBytes(bytes: number): string {
   if (bytes === 0) return "0 B";
   const k = 1024;
@@ -69,6 +71,9 @@ function formatLastChecked(
 }
 
 interface SettingsSystemTabProps {
+  gpuPreferences: GpuPreferences;
+  setGpuPreferences: (prefs: Partial<GpuPreferences>) => void;
+  applyGpuPreferences: (prefs: Partial<GpuPreferences>) => Promise<unknown> | undefined;
   sessionLogsEnabled: boolean;
   setSessionLogsEnabled: (enabled: boolean) => void;
   sessionLogsDir: string;
@@ -93,6 +98,9 @@ interface SettingsSystemTabProps {
 }
 
 const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
+  gpuPreferences,
+  setGpuPreferences,
+  applyGpuPreferences,
   sessionLogsEnabled,
   setSessionLogsEnabled,
   sessionLogsDir,
@@ -116,6 +124,8 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
 }) => {
   const { t } = useI18n();
   const isMac = typeof navigator !== "undefined" && /Mac/i.test(navigator.platform);
+
+  const [showGpuApplySuccess, setShowGpuApplySuccess] = useState(false);
 
   const [tempDirInfo, setTempDirInfo] = useState<TempDirInfo | null>(null);
   const [isLoading, setIsLoading] = useState(false);
@@ -557,6 +567,90 @@ const SettingsSystemTab: React.FC<SettingsSystemTabProps> = ({
               </p>
             </div>
           </div>
+
+          {/* GPU Acceleration Section - only shown on macOS */}
+          {isMac && (
+            <div className="space-y-4">
+              <div className="flex items-center gap-2">
+                <AlertTriangle size={18} className="text-muted-foreground" />
+                <h3 className="text-base font-medium">{t("settings.gpu.title")}</h3>
+              </div>
+
+              <div className="bg-muted/30 rounded-lg p-4 space-y-4">
+                <p className="text-sm text-muted-foreground">
+                  {t("settings.gpu.description")}
+                </p>
+
+                <SettingRow
+                  label={t("settings.gpu.disableGpu")}
+                  description={t("settings.gpu.disableGpuDesc")}
+                >
+                  <Toggle
+                    checked={!!gpuPreferences.disableGpu}
+                    onChange={(val) => {
+                      const next = { ...gpuPreferences, disableGpu: val };
+                      setGpuPreferences(next);
+                    }}
+                  />
+                </SettingRow>
+
+                <SettingRow
+                  label={t("settings.gpu.disableBlendFuncExtended")}
+                  description={t("settings.gpu.disableBlendFuncExtendedDesc")}
+                >
+                  <Toggle
+                    checked={!!gpuPreferences.disableBlendFuncExtended}
+                    onChange={(val) => {
+                      const next = { ...gpuPreferences, disableBlendFuncExtended: val };
+                      setGpuPreferences(next);
+                    }}
+                  />
+                </SettingRow>
+
+                <SettingRow
+                  label={t("settings.gpu.useAngle")}
+                  description={t("settings.gpu.useAngleDesc")}
+                >
+                  <Select
+                    value={gpuPreferences.useAngle ?? GPU_USE_ANGLE_DEFAULT}
+                    options={[
+                      { value: GPU_USE_ANGLE_DEFAULT, label: 'Default (Disabled)' },
+                      { value: 'opengl', label: 'opengl' },
+                      { value: 'swiftshader', label: 'swiftshader' },
+                      { value: 'swiftshader_webgl', label: 'swiftshader_webgl' },
+                    ]}
+                    onChange={(val) => {
+                      const next = {
+                        ...gpuPreferences,
+                        useAngle: val === GPU_USE_ANGLE_DEFAULT ? undefined : val,
+                      };
+                      setGpuPreferences(next);
+                    }}
+                    className="w-44"
+                  />
+                </SettingRow>
+
+                <div className="pt-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={async () => {
+                      await applyGpuPreferences(gpuPreferences);
+                      setShowGpuApplySuccess(true);
+                      setTimeout(() => setShowGpuApplySuccess(false), 3000);
+                    }}
+                  >
+                    {t("settings.gpu.apply")}
+                  </Button>
+                  {showGpuApplySuccess && (
+                    <p className="text-sm text-green-600 dark:text-green-400 mt-2">
+                      {t("settings.gpu.applySuccess")}
+                    </p>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
 
           {/* Crash Logs Section */}
           <div className="space-y-4">

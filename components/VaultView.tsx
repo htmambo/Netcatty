@@ -31,7 +31,7 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import React, { Suspense, lazy, memo, startTransition, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { Suspense, lazy, memo, startTransition, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useI18n } from "../application/i18n/I18nProvider";
 import { activeTabStore, useActiveTabId } from "../application/state/activeTabStore";
 import { useStoredViewMode } from "../application/state/useStoredViewMode";
@@ -41,7 +41,12 @@ import { resolveGroupDefaults, applyGroupDefaults } from "../domain/groupConfig"
 import { getEffectiveHostDistro, sanitizeHost } from "../domain/host";
 import { importVaultHostsFromText, exportHostsToCsvWithStats } from "../domain/vaultImport";
 import type { VaultImportFormat } from "../domain/vaultImport";
-import { tokenizeDatabaseCommand } from "../domain/databaseSchemaView";
+import {
+  applyDatabaseObjectDetails,
+  mergeDatabaseSchema,
+  tokenizeDatabaseCommand,
+} from "../domain/databaseSchemaView";
+import type { DatabaseObjectSelection } from "../domain/databaseSchemaView";
 import { STORAGE_KEY_VAULT_HOSTS_VIEW_MODE, STORAGE_KEY_VAULT_HOSTS_TREE_EXPANDED, STORAGE_KEY_VAULT_SIDEBAR_COLLAPSED, STORAGE_KEY_SHOW_RECENT_HOSTS } from "../infrastructure/config/storageKeys";
 import { cn } from "../lib/utils";
 import { useInstantThemeSwitch } from "../lib/useInstantThemeSwitch";
@@ -242,6 +247,8 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
   const [databaseConfigs, setDatabaseConfigs] = useState<DatabaseConfig[]>([]);
   const [databaseSessions, setDatabaseSessions] = useState<DatabaseSession[]>([]);
   const [databaseSchemas, setDatabaseSchemas] = useState<Record<string, unknown>>({});
+  const loadingDatabaseSchemaIdsRef = useRef<Set<string>>(new Set());
+  const loadingDatabaseObjectDetailsIdsRef = useRef<Set<string>>(new Set());
   const activeTabId = useActiveTabId();
   const isDatabaseTabActive = activeTabId.startsWith("database:");
   const activeDatabaseSessionId = isDatabaseTabActive
@@ -540,26 +547,131 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
     onDatabaseConfigsChange?.(databaseConfigs);
   }, [databaseConfigs, onDatabaseConfigsChange]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     onDatabaseSessionsChange?.(databaseSessions);
   }, [databaseSessions, onDatabaseSessionsChange]);
 
-  const loadDatabaseSchema = useCallback(async (sessionId: string) => {
+  const loadDatabaseSchema = useCallback(async (sessionId: string, databaseName?: string) => {
+    const requestId = databaseName ? `${sessionId}:${databaseName}` : sessionId;
+    if (loadingDatabaseSchemaIdsRef.current.has(requestId)) {
+      return;
+    }
+    loadingDatabaseSchemaIdsRef.current.add(requestId);
     try {
       const { netcattyBridge: bridgeModule } = await import("../infrastructure/services/netcattyBridge");
       const bridge = bridgeModule.get();
       if (!bridge?.db) return;
-      const schema = await bridge.db.getSchema(sessionId);
+      const schema = await bridge.db.getSchema(sessionId, databaseName);
+      if (
+        schema &&
+        typeof schema === "object" &&
+        "ok" in schema &&
+        schema.ok === false
+      ) {
+        console.error(
+          `Failed to load schema for session ${sessionId}${databaseName ? ` (${databaseName})` : ""}:`,
+          schema.error,
+        );
+        if (!databaseName) {
+          setDatabaseSchemas((prev) => ({
+            ...prev,
+            [sessionId]: schema,
+          }));
+        }
+        return;
+      }
       if (schema) {
         setDatabaseSchemas((prev) => ({
           ...prev,
-          [sessionId]: schema,
+          [sessionId]:
+            databaseName && prev[sessionId]
+              ? mergeDatabaseSchema(prev[sessionId], schema)
+              : schema,
         }));
       }
     } catch (err) {
-      console.error(`Failed to load schema for session ${sessionId}:`, err);
+      console.error(
+        `Failed to load schema for session ${sessionId}${databaseName ? ` (${databaseName})` : ""}:`,
+        err,
+      );
+    } finally {
+      loadingDatabaseSchemaIdsRef.current.delete(requestId);
     }
   }, []);
+
+  const loadDatabaseObjectDetails = useCallback(
+    async (sessionId: string, selection: DatabaseObjectSelection) => {
+      const requestId = `${sessionId}:${selection.id}`;
+      if (loadingDatabaseObjectDetailsIdsRef.current.has(requestId)) {
+        return;
+      }
+
+      loadingDatabaseObjectDetailsIdsRef.current.add(requestId);
+      try {
+        const { netcattyBridge: bridgeModule } = await import("../infrastructure/services/netcattyBridge");
+        const bridge = bridgeModule.get();
+        if (!bridge?.db?.getObjectDetails) {
+          return { ok: false, error: "Database object details are unavailable" };
+        }
+
+        const details = await bridge.db.getObjectDetails(sessionId, selection);
+        if (
+          details &&
+          typeof details === "object" &&
+          "ok" in details &&
+          details.ok === false
+        ) {
+          return details;
+        }
+
+        if (details && typeof details === "object" && "object" in details) {
+          setDatabaseSchemas((prev) => {
+            const existingSchema = prev[sessionId];
+            if (!existingSchema) return prev;
+
+            return {
+              ...prev,
+              [sessionId]: applyDatabaseObjectDetails(
+                existingSchema,
+                selection,
+                (details as { object?: { columns?: unknown[] } }).object || {},
+              ),
+            };
+          });
+        }
+
+        return details;
+      } catch (err) {
+        console.error(`Failed to load object details for session ${sessionId}:`, err);
+        return { ok: false, error: String(err) };
+      } finally {
+        loadingDatabaseObjectDetailsIdsRef.current.delete(requestId);
+      }
+    },
+    [],
+  );
+
+  const queryDatabaseTableData = useCallback(
+    async (
+      sessionId: string,
+      selection: DatabaseObjectSelection,
+      page: number,
+      pageSize: number,
+    ) => {
+      try {
+        const { netcattyBridge: bridgeModule } = await import("../infrastructure/services/netcattyBridge");
+        const bridge = bridgeModule.get();
+        if (!bridge?.db?.queryTableData) {
+          return { ok: false, error: "Paginated database preview is unavailable" };
+        }
+        return await bridge.db.queryTableData(sessionId, selection, page, pageSize);
+      } catch (err) {
+        console.error(`Failed to query paginated table data for session ${sessionId}:`, err);
+        return { ok: false, error: String(err) };
+      }
+    },
+    [],
+  );
 
   useEffect(() => {
     const connectedSessionIds = new Set(
@@ -3787,6 +3899,11 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
               schema={databaseSchemas[sessionId]}
               onDisconnect={() => handleDatabaseDisconnect(sessionId)}
               onExecuteQuery={handleExecuteQuery}
+              onLoadObjectDetails={(selection) => loadDatabaseObjectDetails(sessionId, selection)}
+              onQueryTableData={(selection, page, pageSize) =>
+                queryDatabaseTableData(sessionId, selection, page, pageSize)
+              }
+              onLoadSchemaDatabase={(databaseName) => loadDatabaseSchema(sessionId, databaseName)}
               onRefreshSchema={handleRefreshSchema}
             />
           </div>

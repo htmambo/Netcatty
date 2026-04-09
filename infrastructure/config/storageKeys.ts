@@ -129,3 +129,6 @@ export const STORAGE_KEY_GENERIC_CREDENTIALS = 'netcatty_generic_credentials_v1'
 // Debug Flags (no _v1 suffix — developer-only, not persisted data)
 export const STORAGE_KEY_DEBUG_HOTKEYS = 'debug.hotkeys';
 export const STORAGE_KEY_DEBUG_UPDATE_DEMO = 'debug.updateDemo';
+
+// GPU Preferences
+export const STORAGE_KEY_GPU_PREFERENCES = 'netcatty_gpu_preferences_v1';

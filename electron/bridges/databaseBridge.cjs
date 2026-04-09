@@ -560,7 +560,7 @@ async function handleExecute(event, payload) {
  * POST body: { sessionId: string }
  */
 async function handleGetSchema(event, payload) {
-  const { sessionId } = payload;
+  const { sessionId, database } = payload;
 
   if (!sessionId) {
     return { ok: false, error: "Session ID is required" };
@@ -574,7 +574,7 @@ async function handleGetSchema(event, payload) {
   if (session.driver === "mysql") {
     const bridge = getSubBridge("mysql");
     if (!bridge) return { ok: false, error: "MySQL driver not available" };
-    return bridge.getSchema(session.clientOrPool, session.config.database);
+    return bridge.getSchema(session.clientOrPool, database || null);
   }
 
   if (session.driver === "redis") {
@@ -584,6 +584,69 @@ async function handleGetSchema(event, payload) {
   }
 
   return { ok: false, error: `Unknown driver: ${session.driver}` };
+}
+
+/**
+ * Get details for a specific database object.
+ * POST body: { sessionId: string, selection: { kind: string, name?: string, schemaName?: string } }
+ */
+async function handleGetObjectDetails(event, payload) {
+  const { sessionId, selection } = payload || {};
+
+  if (!sessionId) {
+    return { ok: false, error: "Session ID is required" };
+  }
+
+  if (!selection || typeof selection !== "object") {
+    return { ok: false, error: "Object selection is required" };
+  }
+
+  const session = dbSessions?.get(sessionId);
+  if (!session) {
+    return { ok: false, error: "Session not found or not connected" };
+  }
+
+  if (session.driver === "mysql") {
+    const bridge = getSubBridge("mysql");
+    if (!bridge) return { ok: false, error: "MySQL driver not available" };
+    return bridge.getObjectDetails(session.clientOrPool, selection, session.config.database);
+  }
+
+  return { ok: false, error: `Object details are not supported for ${session.driver}` };
+}
+
+/**
+ * Query paginated data for a specific table or view.
+ * POST body: { sessionId: string, selection: object, page?: number, pageSize?: number }
+ */
+async function handleQueryTableData(event, payload) {
+  const { sessionId, selection, page, pageSize } = payload || {};
+
+  if (!sessionId) {
+    return { ok: false, error: "Session ID is required" };
+  }
+
+  if (!selection || typeof selection !== "object") {
+    return { ok: false, error: "Object selection is required" };
+  }
+
+  const session = dbSessions?.get(sessionId);
+  if (!session) {
+    return { ok: false, error: "Session not found or not connected" };
+  }
+
+  if (session.driver === "mysql") {
+    const bridge = getSubBridge("mysql");
+    if (!bridge) return { ok: false, error: "MySQL driver not available" };
+    return bridge.queryTableData(
+      session.clientOrPool,
+      selection,
+      { page, pageSize },
+      session.config.database,
+    );
+  }
+
+  return { ok: false, error: `Paginated table data is not supported for ${session.driver}` };
 }
 
 /**
@@ -637,6 +700,8 @@ function registerHandlers(ipcMain) {
   ipcMain.handle("netcatty:db:getStatus", handleGetStatus);
   ipcMain.handle("netcatty:db:execute", handleExecute);
   ipcMain.handle("netcatty:db:getSchema", handleGetSchema);
+  ipcMain.handle("netcatty:db:getObjectDetails", handleGetObjectDetails);
+  ipcMain.handle("netcatty:db:queryTableData", handleQueryTableData);
   ipcMain.handle("netcatty:db:listObjects", handleListObjects);
 }
 

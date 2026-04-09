@@ -1,5 +1,11 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type SetStateAction } from 'react';
 import { SyncConfig, TerminalSettings, HotkeyScheme, CustomKeyBindings, DEFAULT_KEY_BINDINGS, KeyBinding, UILanguage, SessionLogFormat, normalizeTerminalSettings } from '../../domain/models';
+
+interface GpuPreferences {
+  disableGpu?: boolean;
+  disableBlendFuncExtended?: boolean;
+  useAngle?: string;
+}
 import {
   STORAGE_KEY_COLOR,
   STORAGE_KEY_SYNC,
@@ -33,6 +39,7 @@ import {
   STORAGE_KEY_GLOBAL_HOTKEY_ENABLED,
   STORAGE_KEY_AUTO_UPDATE_ENABLED,
   STORAGE_KEY_WORKSPACE_FOCUS_STYLE,
+  STORAGE_KEY_GPU_PREFERENCES,
 
 } from '../../infrastructure/config/storageKeys';
 import { DEFAULT_UI_LOCALE, resolveSupportedLocale } from '../../infrastructure/config/i18n';
@@ -297,6 +304,37 @@ export const useSettingsState = () => {
     if (stored === null) return true; // Default to enabled
     return stored === 'true';
   });
+  // GPU preferences — stored in main process userData, synced to localStorage for UI display
+  const [gpuPreferences, setGpuPreferencesState] = useState<GpuPreferences>(() => {
+    const stored = readStoredString(STORAGE_KEY_GPU_PREFERENCES);
+    if (stored === null) {
+      return { disableGpu: true, disableBlendFuncExtended: true, useAngle: "opengl" };
+    }
+    try {
+      return JSON.parse(stored) as GpuPreferences;
+    } catch {
+      return { disableGpu: true, disableBlendFuncExtended: true, useAngle: "opengl" };
+    }
+  });
+
+  const setGpuPreferences = useCallback((prefs: Partial<GpuPreferences>) => {
+    setGpuPreferencesState((prev) => {
+      const next = { ...prev, ...prefs };
+      localStorageAdapter.writeString(STORAGE_KEY_GPU_PREFERENCES, JSON.stringify(next));
+      netcattyBridge.get()?.setGpuPreferences?.(next);
+      return next;
+    });
+  }, []);
+
+  const applyGpuPreferences = useCallback((prefs: Partial<GpuPreferences>) => {
+    setGpuPreferencesState((prev) => {
+      const next = { ...prev, ...prefs };
+      localStorageAdapter.writeString(STORAGE_KEY_GPU_PREFERENCES, JSON.stringify(next));
+      return next;
+    });
+    return netcattyBridge.get()?.applyGpuPreferences?.(prefs);
+  }, []);
+
   const incomingTerminalSettingsSignatureRef = useRef<string | null>(null);
   const localTerminalSettingsVersionRef = useRef(0);
   const broadcastedLocalTerminalSettingsVersionRef = useRef(0);
@@ -1213,6 +1251,9 @@ export const useSettingsState = () => {
     hotkeyRegistrationError,
     globalHotkeyEnabled,
     setGlobalHotkeyEnabled,
+    gpuPreferences,
+    setGpuPreferences,
+    applyGpuPreferences,
     rehydrateAllFromStorage,
     reapplyCurrentTheme,
     workspaceFocusStyle,

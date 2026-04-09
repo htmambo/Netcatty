@@ -5,15 +5,160 @@
 
 const mysql = require("mysql2/promise");
 const {
-  MAX_ROWS,
   DEFAULT_CONNECTION_TIMEOUT,
   DEFAULT_QUERY_TIMEOUT,
   detectCommand,
   formatQueryResult,
   buildErrorResult,
   validateConfig,
-  maskSensitiveConfig,
 } = require("./base.cjs");
+
+const SYSTEM_DATABASES = ["information_schema", "performance_schema", "mysql", "sys"];
+const TABLE_DETAILS_CACHE_TTL_MS = 2 * 60 * 1000;
+const DEFAULT_TABLE_DATA_PAGE_SIZE = 100;
+const MAX_TABLE_DATA_PAGE_SIZE = 500;
+const PREVIEW_TEXT_LENGTH = 256;
+const GEOMETRY_TYPES = [
+  "geometry",
+  "point",
+  "linestring",
+  "polygon",
+  "multipoint",
+  "multilinestring",
+  "multipolygon",
+  "geometrycollection",
+];
+const tableDetailsCacheByPool = new WeakMap();
+
+function buildExcludedSchemasClause(columnName) {
+  const placeholders = SYSTEM_DATABASES.map(() => "?").join(", ");
+  return {
+    clause: `${columnName} NOT IN (${placeholders})`,
+    params: [...SYSTEM_DATABASES],
+  };
+}
+
+function quoteIdentifier(identifier) {
+  return `\`${String(identifier || "").replace(/`/g, "``")}\``;
+}
+
+function normalizePositiveInteger(value, fallback, max = Number.POSITIVE_INFINITY) {
+  const numeric = Number.parseInt(String(value ?? ""), 10);
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return fallback;
+  }
+  return Math.min(numeric, max);
+}
+
+function buildQualifiedTableName(schemaName, objectName) {
+  return `${quoteIdentifier(schemaName)}.${quoteIdentifier(objectName)}`;
+}
+
+function buildPreviewColumnExpression(column) {
+  const columnRef = quoteIdentifier(column?.name || "");
+  const alias = quoteIdentifier(column?.name || "");
+  const type = String(column?.dataType || "").trim().toLowerCase();
+
+  if (
+    type.includes("blob") ||
+    type.includes("binary") ||
+    type.startsWith("bit")
+  ) {
+    return `CASE WHEN ${columnRef} IS NULL THEN NULL ELSE CONCAT('<binary ', OCTET_LENGTH(${columnRef}), ' bytes>') END AS ${alias}`;
+  }
+
+  if (GEOMETRY_TYPES.some((entry) => type.startsWith(entry))) {
+    return `CASE WHEN ${columnRef} IS NULL THEN NULL ELSE ST_AsText(${columnRef}) END AS ${alias}`;
+  }
+
+  if (type.includes("text") || type.startsWith("json")) {
+    return `CASE WHEN ${columnRef} IS NULL THEN NULL WHEN CHAR_LENGTH(CAST(${columnRef} AS CHAR)) > ${PREVIEW_TEXT_LENGTH} THEN CONCAT(LEFT(CAST(${columnRef} AS CHAR), ${PREVIEW_TEXT_LENGTH}), '...') ELSE CAST(${columnRef} AS CHAR) END AS ${alias}`;
+  }
+
+  return columnRef;
+}
+
+async function getApproximateRowCount(pool, schemaName, objectName) {
+  try {
+    const [rows] = await pool.execute(
+      `SELECT TABLE_ROWS, TABLE_TYPE
+       FROM INFORMATION_SCHEMA.TABLES
+       WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
+       LIMIT 1`,
+      [schemaName, objectName],
+    );
+    const row = Array.isArray(rows) ? rows[0] : null;
+    if (!row) return { totalRows: undefined, estimated: false };
+
+    const rawCount = row.TABLE_ROWS;
+    const totalRows =
+      typeof rawCount === "number"
+        ? rawCount
+        : Number.parseInt(String(rawCount || ""), 10);
+
+    if (!Number.isFinite(totalRows) || totalRows < 0) {
+      return { totalRows: undefined, estimated: false };
+    }
+
+    return {
+      totalRows,
+      estimated: String(row.TABLE_TYPE || "").toUpperCase() !== "VIEW",
+    };
+  } catch {
+    return { totalRows: undefined, estimated: false };
+  }
+}
+
+function getPoolDetailsCache(pool) {
+  let cache = tableDetailsCacheByPool.get(pool);
+  if (!cache) {
+    cache = new Map();
+    tableDetailsCacheByPool.set(pool, cache);
+  }
+  return cache;
+}
+
+function clearPoolDetailsCache(pool) {
+  if (pool) {
+    tableDetailsCacheByPool.delete(pool);
+  }
+}
+
+function getCachedTableDetails(pool, cacheKey) {
+  const cache = tableDetailsCacheByPool.get(pool);
+  if (!cache) return null;
+
+  const cached = cache.get(cacheKey);
+  if (!cached) return null;
+
+  if (Date.now() - cached.cachedAt > TABLE_DETAILS_CACHE_TTL_MS) {
+    cache.delete(cacheKey);
+    return null;
+  }
+
+  return cached.value;
+}
+
+function setCachedTableDetails(pool, cacheKey, value) {
+  const cache = getPoolDetailsCache(pool);
+  cache.set(cacheKey, {
+    cachedAt: Date.now(),
+    value,
+  });
+}
+
+async function getCurrentDatabase(pool) {
+  try {
+    const [rows] = await pool.query("SELECT DATABASE() AS currentDatabase");
+    if (Array.isArray(rows) && rows[0]) {
+      return rows[0].currentDatabase || null;
+    }
+  } catch {
+    // ignore
+  }
+
+  return null;
+}
 
 /**
  * Test a MySQL connection without creating a persistent pool.
@@ -167,10 +312,11 @@ async function executeQuery(pool, query, params = [], options = {}) {
 
   const queryTimeout = options.queryTimeout || DEFAULT_QUERY_TIMEOUT;
   const commandType = detectCommand(query);
+  const hasParams = Array.isArray(params) && params.length > 0;
 
   try {
     const [rows, fields] = await Promise.race([
-      pool.execute(query, params),
+      hasParams ? pool.execute(query, params) : pool.query(query),
       timeout(queryTimeout, "Query timed out"),
     ]);
 
@@ -200,7 +346,7 @@ function timeout(ms, message) {
  * Get the database schema (databases, tables, columns, indexes).
  *
  * @param {object} pool - The mysql2 pool
- * @param {string} [database] - Specific database to query (optional, defaults to connected DB)
+ * @param {string} [database] - Specific database to query (optional)
  * @returns {Promise<{ok: boolean, schema?: object, error?: string}>}
  */
 async function getSchema(pool, database = null) {
@@ -209,130 +355,270 @@ async function getSchema(pool, database = null) {
   }
 
   try {
+    clearPoolDetailsCache(pool);
+
     const schema = {
+      serverVersion: "unknown",
       databases: [],
       tables: [],
       views: [],
       routines: [],
     };
 
+    let currentDatabase = null;
+    try {
+      const [versionRows] = await pool.query("SELECT VERSION() AS version, DATABASE() AS currentDatabase");
+      if (Array.isArray(versionRows) && versionRows[0]) {
+        schema.serverVersion = versionRows[0].version || "unknown";
+        currentDatabase = versionRows[0].currentDatabase || null;
+      }
+    } catch {
+      // Version and current database are best-effort only
+    }
+
     // Get databases
     try {
-      const [dbRows] = await pool.execute("SHOW DATABASES");
-      schema.databases = dbRows.map((r) => r.Database || r.Database_name).filter(Boolean);
+      const [dbRows] = await pool.query("SHOW DATABASES");
+      schema.databases = dbRows
+        .map((r) => r.Database || r.Database_name)
+        .filter((name) => Boolean(name) && !SYSTEM_DATABASES.includes(name));
     } catch {
       // SHOW DATABASES may require privileges; continue with empty
     }
 
+    if (
+      schema.databases.length === 0 &&
+      currentDatabase &&
+      !SYSTEM_DATABASES.includes(currentDatabase)
+    ) {
+      schema.databases = [currentDatabase];
+    }
+
+    schema.loadedDatabases = [];
+
+    if (!database) {
+      return { ok: true, schema };
+    }
+
+    const targetDatabase = database;
+    if (!schema.databases.includes(targetDatabase)) {
+      schema.databases = [...schema.databases, targetDatabase].sort();
+    }
+
     // Get tables in the current/specified database
-    const tableQuery = database
-      ? `SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE, TABLE_ROWS, DATA_LENGTH, INDEX_LENGTH FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME`
-      : "SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE, TABLE_ROWS, DATA_LENGTH, INDEX_LENGTH FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME";
-
-    const queryParams = database ? [database] : [];
-
     try {
-      const [tableRows] = await pool.execute(tableQuery, queryParams);
+      const [tableRows] = await pool.query(
+        `SHOW FULL TABLES FROM ${quoteIdentifier(targetDatabase)}`,
+      );
+      schema.tables = tableRows.map((r) => ({
+        database: targetDatabase,
+        name: Object.values(r)[0],
+        type: Object.values(r)[1],
+        rowCount: 0,
+        dataLength: 0,
+        indexLength: 0,
+      }));
+    } catch {
+      // Fallback to INFORMATION_SCHEMA for permissions/compatibility issues
+      const [tableRows] = await pool.execute(
+        `SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE, TABLE_ROWS, DATA_LENGTH, INDEX_LENGTH
+         FROM INFORMATION_SCHEMA.TABLES
+         WHERE TABLE_SCHEMA = ?
+         ORDER BY TABLE_NAME`,
+        [targetDatabase],
+      );
       schema.tables = tableRows.map((r) => ({
         database: r.TABLE_SCHEMA,
         name: r.TABLE_NAME,
-        type: r.TABLE_TYPE, // BASE TABLE, VIEW, SYSTEM VIEW
+        type: r.TABLE_TYPE,
         rowCount: r.TABLE_ROWS || 0,
         dataLength: r.DATA_LENGTH || 0,
         indexLength: r.INDEX_LENGTH || 0,
       }));
-    } catch {
-      // Fallback to SHOW TABLES
-      try {
-        const [fallbackRows] = await pool.execute("SHOW TABLES");
-        schema.tables = fallbackRows.map((r) => ({
-          database: database || "",
-          name: Object.values(r)[0],
-          type: "BASE TABLE",
-          rowCount: 0,
-          dataLength: 0,
-          indexLength: 0,
-        }));
-      } catch {
-        // Skip tables
-      }
     }
 
-    // Get columns for each table (limited to first 20 tables to avoid performance issues)
-    const tablesToInspect = schema.tables.slice(0, 20);
-    const columnPromises = tablesToInspect.map(async (table) => {
-      try {
-        const colQuery = database
-          ? `SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY, COLUMN_DEFAULT, EXTRA, COLUMN_COMMENT FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION`
-          : "SELECT COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY, COLUMN_DEFAULT, EXTRA, COLUMN_COMMENT FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION";
-        const colParams = database ? [database, table.name] : [table.name];
-        const [colRows] = await pool.execute(colQuery, colParams);
-        return {
-          table: table.name,
-          columns: colRows.map((c) => ({
-            name: c.COLUMN_NAME,
-            dataType: c.DATA_TYPE,
-            fullType: c.COLUMN_TYPE,
-            nullable: c.IS_NULLABLE === "YES",
-            key: c.COLUMN_KEY,
-            defaultValue: c.COLUMN_DEFAULT,
-            extra: c.EXTRA,
-            comment: c.COLUMN_COMMENT || "",
-          })),
-        };
-      } catch {
-        return { table: table.name, columns: [] };
-      }
-    });
-
-    const columnResults = await Promise.all(columnPromises);
-    for (const colResult of columnResults) {
-      const tableEntry = schema.tables.find((t) => t.name === colResult.table);
-      if (tableEntry) {
-        tableEntry.columns = colResult.columns;
-      }
-    }
-
-    // Get indexes for each table (limited to first 10)
-    const indexedTables = schema.tables.slice(0, 10);
-    const indexPromises = indexedTables.map(async (table) => {
-      try {
-        const idxQuery = database
-          ? `SELECT INDEX_NAME, COLUMN_NAME, NON_UNIQUE, INDEX_TYPE, SEQ_IN_INDEX FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY INDEX_NAME, SEQ_IN_INDEX`
-          : "SELECT INDEX_NAME, COLUMN_NAME, NON_UNIQUE, INDEX_TYPE, SEQ_IN_INDEX FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? ORDER BY INDEX_NAME, SEQ_IN_INDEX";
-        const idxParams = database ? [database, table.name] : [table.name];
-        const [idxRows] = await pool.execute(idxQuery, idxParams);
-
-        // Group by index name
-        const indexMap = new Map();
-        for (const idx of idxRows) {
-          if (!indexMap.has(idx.INDEX_NAME)) {
-            indexMap.set(idx.INDEX_NAME, {
-              name: idx.INDEX_NAME,
-              type: idx.INDEX_TYPE === "FULLTEXT" ? "FULLTEXT" : idx.NON_UNIQUE === 0 ? "UNIQUE" : "INDEX",
-              columns: [],
-            });
-          }
-          indexMap.get(idx.INDEX_NAME).columns.push(idx.COLUMN_NAME);
-        }
-
-        return { table: table.name, indexes: Array.from(indexMap.values()) };
-      } catch {
-        return { table: table.name, indexes: [] };
-      }
-    });
-
-    const indexResults = await Promise.all(indexPromises);
-    for (const idxResult of indexResults) {
-      const tableEntry = schema.tables.find((t) => t.name === idxResult.table);
-      if (tableEntry) {
-        tableEntry.indexes = idxResult.indexes;
-      }
-    }
+    schema.loadedDatabases = [targetDatabase];
 
     return { ok: true, schema };
   } catch (err) {
     return buildErrorResult(err, "Failed to retrieve schema");
+  }
+}
+
+/**
+ * Get column details for a specific table or view.
+ *
+ * @param {object} pool - The mysql2 pool
+ * @param {object} selection - Object selection payload
+ * @param {string} [database] - Default database name
+ * @returns {Promise<object>}
+ */
+async function getObjectDetails(pool, selection, database = null) {
+  if (!pool) {
+    return buildErrorResult("No pool available");
+  }
+
+  const objectName = typeof selection?.name === "string" ? selection.name : "";
+  const objectKind = typeof selection?.kind === "string" ? selection.kind : "";
+  const schemaName =
+    typeof selection?.schemaName === "string" && selection.schemaName
+      ? selection.schemaName
+      : database || (await getCurrentDatabase(pool));
+
+  if (!objectName || (objectKind !== "table" && objectKind !== "view")) {
+    return buildErrorResult("Unsupported database object");
+  }
+
+  if (!schemaName) {
+    return buildErrorResult("Database name is required for table details");
+  }
+
+  const cacheKey = `${schemaName}:${objectKind}:${objectName}`;
+  const cached = getCachedTableDetails(pool, cacheKey);
+  if (cached) {
+    return {
+      ok: true,
+      object: cached,
+    };
+  }
+
+  try {
+    const sql = `SHOW FULL COLUMNS FROM ${quoteIdentifier(objectName)} FROM ${quoteIdentifier(schemaName)}`;
+    const [rows] = await pool.query(sql);
+    const columns = Array.isArray(rows)
+      ? rows.map((row) => ({
+          name: row.Field,
+          dataType: row.Type,
+          fullType: row.Type,
+          nullable: row.Null === "YES",
+          key: row.Key,
+          primaryKey: row.Key === "PRI",
+          defaultValue: row.Default,
+          extra: row.Extra,
+          comment: row.Comment || "",
+        }))
+      : [];
+
+    const object = {
+      database: schemaName,
+      schemaName,
+      name: objectName,
+      kind: objectKind,
+      columns,
+    };
+
+    setCachedTableDetails(pool, cacheKey, object);
+
+    return {
+      ok: true,
+      object,
+    };
+  } catch (err) {
+    return buildErrorResult(err, "Failed to retrieve object details");
+  }
+}
+
+/**
+ * Query paginated table/view data optimized for preview.
+ *
+ * @param {object} pool - The mysql2 pool
+ * @param {object} selection - Object selection payload
+ * @param {object} [options] - Pagination options
+ * @param {number} [options.page=1] - 1-based page number
+ * @param {number} [options.pageSize=100] - Page size
+ * @param {number} [options.queryTimeout] - Query timeout in ms
+ * @param {string} [database] - Default database name
+ * @returns {Promise<object>}
+ */
+async function queryTableData(pool, selection, options = {}, database = null) {
+  if (!pool) {
+    return buildErrorResult("No pool available");
+  }
+
+  const page = normalizePositiveInteger(options.page, 1);
+  const pageSize = normalizePositiveInteger(
+    options.pageSize,
+    DEFAULT_TABLE_DATA_PAGE_SIZE,
+    MAX_TABLE_DATA_PAGE_SIZE,
+  );
+  const queryTimeout = options.queryTimeout || DEFAULT_QUERY_TIMEOUT;
+  const details = await getObjectDetails(pool, selection, database);
+  if (!details?.ok) {
+    return details;
+  }
+
+  const object = details.object || {};
+  const objectName = typeof object.name === "string" ? object.name : "";
+  const schemaName =
+    typeof object.schemaName === "string" && object.schemaName
+      ? object.schemaName
+      : typeof object.database === "string" && object.database
+        ? object.database
+        : database || (await getCurrentDatabase(pool));
+
+  if (!objectName || !schemaName) {
+    return buildErrorResult("Database object is incomplete");
+  }
+
+  const columns = Array.isArray(object.columns) ? object.columns : [];
+  const qualifiedName = buildQualifiedTableName(schemaName, objectName);
+  const offset = (page - 1) * pageSize;
+  const fetchLimit = pageSize + 1;
+  const selectList =
+    columns.length > 0
+      ? columns.map((column) => buildPreviewColumnExpression(column)).join(",\n")
+      : "*";
+  const query = `SELECT\n${selectList}\nFROM ${qualifiedName}\nLIMIT ${pageSize}${offset > 0 ? ` OFFSET ${offset}` : ""};`;
+  const dataQuery = `SELECT\n${selectList}\nFROM ${qualifiedName}\nLIMIT ? OFFSET ?`;
+
+  const totalCountMeta = await getApproximateRowCount(pool, schemaName, objectName);
+  const startTime = Date.now();
+
+  try {
+    const [rows, fields] = await Promise.race([
+      pool.execute(dataQuery, [fetchLimit, offset]),
+      timeout(queryTimeout, "Query timed out"),
+    ]);
+
+    const rawRows = Array.isArray(rows) ? rows : [];
+    const hasMore = rawRows.length > pageSize;
+    const pageRows = hasMore ? rawRows.slice(0, pageSize) : rawRows;
+    const knownMinimumTotal = offset + pageRows.length + (hasMore ? 1 : 0);
+    const resolvedTotalRows =
+      typeof totalCountMeta.totalRows === "number"
+        ? Math.max(totalCountMeta.totalRows, knownMinimumTotal)
+        : knownMinimumTotal > 0 || !hasMore
+          ? knownMinimumTotal
+          : undefined;
+
+    return {
+      ok: true,
+      type: "SELECT",
+      query,
+      rows: pageRows,
+      fields:
+        Array.isArray(fields) && fields.length > 0
+          ? fields.map((field) => field.name)
+          : pageRows.length > 0
+            ? Object.keys(pageRows[0])
+            : columns.map((column) => column.name),
+      rowCount: pageRows.length,
+      totalRows: resolvedTotalRows,
+      totalRowsEstimated:
+        totalCountMeta.estimated ||
+        (typeof totalCountMeta.totalRows !== "number" && hasMore),
+      page,
+      pageSize,
+      offset,
+      hasMore,
+      durationMs: Date.now() - startTime,
+      message: `${pageRows.length} row(s) returned`,
+    };
+  } catch (err) {
+    if (err.message === "Query timed out") {
+      return buildErrorResult(`Query exceeded timeout of ${queryTimeout}ms`, "Query timeout");
+    }
+    return buildErrorResult(err, "Failed to query table data");
   }
 }
 
@@ -352,13 +638,32 @@ async function listObjects(pool, type = "all", database = null) {
   const objects = [];
 
   try {
+    let currentDatabase = null;
+    try {
+      const [rows] = await pool.query("SELECT DATABASE() AS currentDatabase");
+      if (Array.isArray(rows) && rows[0]) {
+        currentDatabase = rows[0].currentDatabase || null;
+      }
+    } catch {
+      // ignore
+    }
+    const targetDatabase = database || currentDatabase || null;
+    const excludedSchemas = buildExcludedSchemasClause("TABLE_SCHEMA");
+    const excludedRoutineSchemas = buildExcludedSchemasClause("ROUTINE_SCHEMA");
+
     // Tables and views
     if (type === "all" || type === "tables" || type === "views") {
       try {
-        const tableQuery = database
-          ? `SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME`
-          : `SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME`;
-        const queryParams = database ? [database] : [];
+        const tableQuery = targetDatabase
+          ? `SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE
+             FROM INFORMATION_SCHEMA.TABLES
+             WHERE TABLE_SCHEMA = ?
+             ORDER BY TABLE_NAME`
+          : `SELECT TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE
+             FROM INFORMATION_SCHEMA.TABLES
+             WHERE ${excludedSchemas.clause}
+             ORDER BY TABLE_SCHEMA, TABLE_NAME`;
+        const queryParams = targetDatabase ? [targetDatabase] : excludedSchemas.params;
         const [rows] = await pool.execute(tableQuery, queryParams);
         for (const row of rows) {
           const objType = row.TABLE_TYPE === "VIEW" ? "view" : "table";
@@ -372,18 +677,16 @@ async function listObjects(pool, type = "all", database = null) {
         }
       } catch {
         // Fallback
-        try {
+        if (targetDatabase) {
           const [rows] = await pool.execute("SHOW FULL TABLES");
           for (const row of rows) {
             const name = row[Object.keys(row)[0]];
             const tableType = row[Object.keys(row)[1]];
             const objType = tableType === "VIEW" ? "view" : "table";
             if (type === "all" || type === "tables" || (type === "views" && objType === "view")) {
-              objects.push({ name, type: objType, database: database || "" });
+              objects.push({ name, type: objType, database: targetDatabase });
             }
           }
-        } catch {
-          // Skip
         }
       }
     }
@@ -391,10 +694,16 @@ async function listObjects(pool, type = "all", database = null) {
     // Stored procedures
     if (type === "all" || type === "procedures") {
       try {
-        const procQuery = database
-          ? `SELECT ROUTINE_NAME, ROUTINE_SCHEMA FROM INFORMATION_SCHEMA.ROUTINES WHERE ROUTINE_SCHEMA = ? AND ROUTINE_TYPE = 'PROCEDURE' ORDER BY ROUTINE_NAME`
-          : `SELECT ROUTINE_NAME, ROUTINE_SCHEMA FROM INFORMATION_SCHEMA.ROUTINES WHERE ROUTINE_SCHEMA = DATABASE() AND ROUTINE_TYPE = 'PROCEDURE' ORDER BY ROUTINE_NAME`;
-        const procParams = database ? [database] : [];
+        const procQuery = targetDatabase
+          ? `SELECT ROUTINE_NAME, ROUTINE_SCHEMA
+             FROM INFORMATION_SCHEMA.ROUTINES
+             WHERE ROUTINE_SCHEMA = ? AND ROUTINE_TYPE = 'PROCEDURE'
+             ORDER BY ROUTINE_NAME`
+          : `SELECT ROUTINE_NAME, ROUTINE_SCHEMA
+             FROM INFORMATION_SCHEMA.ROUTINES
+             WHERE ${excludedRoutineSchemas.clause} AND ROUTINE_TYPE = 'PROCEDURE'
+             ORDER BY ROUTINE_SCHEMA, ROUTINE_NAME`;
+        const procParams = targetDatabase ? [targetDatabase] : excludedRoutineSchemas.params;
         const [rows] = await pool.execute(procQuery, procParams);
         for (const row of rows) {
           objects.push({
@@ -411,10 +720,16 @@ async function listObjects(pool, type = "all", database = null) {
     // Stored functions
     if (type === "all" || type === "functions") {
       try {
-        const funcQuery = database
-          ? `SELECT ROUTINE_NAME, ROUTINE_SCHEMA FROM INFORMATION_SCHEMA.ROUTINES WHERE ROUTINE_SCHEMA = ? AND ROUTINE_TYPE = 'FUNCTION' ORDER BY ROUTINE_NAME`
-          : `SELECT ROUTINE_NAME, ROUTINE_SCHEMA FROM INFORMATION_SCHEMA.ROUTINES WHERE ROUTINE_SCHEMA = DATABASE() AND ROUTINE_TYPE = 'FUNCTION' ORDER BY ROUTINE_NAME`;
-        const funcParams = database ? [database] : [];
+        const funcQuery = targetDatabase
+          ? `SELECT ROUTINE_NAME, ROUTINE_SCHEMA
+             FROM INFORMATION_SCHEMA.ROUTINES
+             WHERE ROUTINE_SCHEMA = ? AND ROUTINE_TYPE = 'FUNCTION'
+             ORDER BY ROUTINE_NAME`
+          : `SELECT ROUTINE_NAME, ROUTINE_SCHEMA
+             FROM INFORMATION_SCHEMA.ROUTINES
+             WHERE ${excludedRoutineSchemas.clause} AND ROUTINE_TYPE = 'FUNCTION'
+             ORDER BY ROUTINE_SCHEMA, ROUTINE_NAME`;
+        const funcParams = targetDatabase ? [targetDatabase] : excludedRoutineSchemas.params;
         const [rows] = await pool.execute(funcQuery, funcParams);
         for (const row of rows) {
           objects.push({
@@ -498,6 +813,8 @@ module.exports = {
   createPool,
   executeQuery,
   getSchema,
+  getObjectDetails,
+  queryTableData,
   listObjects,
   destroyPool,
   getServerStatus,

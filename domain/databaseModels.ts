@@ -87,6 +87,7 @@ export interface DatabaseSchema {
   driver: DatabaseDriver;
   serverVersion: string;
   databases?: string[];
+  loadedDatabases?: string[];
   keyspaces?: Array<{
     name: string;
     keys?: number;
@@ -108,6 +109,7 @@ export interface TableInfo {
   name: string;
   schema?: string;
   columns: ColumnInfo[];
+  columnsLoaded?: boolean;
   rowCountEstimate?: number;
 }
 

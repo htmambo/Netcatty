@@ -178,6 +178,51 @@ app.commandLine.appendSwitch("ignore-gpu-blacklist"); // Some Chromium builds us
 app.commandLine.appendSwitch("enable-gpu-rasterization");
 app.commandLine.appendSwitch("enable-zero-copy");
 
+// GPU preferences — loaded from userData so users can persist renderer-side GPU toggles.
+const GPU_PREFS_FILE = "gpu-preferences.json";
+const DEFAULT_GPU_PREFS = {
+  disableGpu: true,
+  disableBlendFuncExtended: true,
+  useAngle: "opengl",
+};
+let gpuPrefs = { ...DEFAULT_GPU_PREFS };
+function getGpuPrefsPath() {
+  try {
+    return path.join(app.getPath("userData"), GPU_PREFS_FILE);
+  } catch {
+    return null;
+  }
+}
+function loadGpuPrefs() {
+  const p = getGpuPrefsPath();
+  if (!p) return;
+  try {
+    if (fs.existsSync(p)) {
+      gpuPrefs = { ...DEFAULT_GPU_PREFS, ...JSON.parse(fs.readFileSync(p, "utf8")) };
+    }
+  } catch {}
+  applyGpuPrefs();
+}
+function saveGpuPrefs() {
+  const p = getGpuPrefsPath();
+  if (!p) return;
+  try {
+    fs.writeFileSync(p, JSON.stringify(gpuPrefs, null, 2), "utf8");
+  } catch {}
+}
+function applyGpuPrefs() {
+  if (gpuPrefs.disableGpu) {
+    app.commandLine.appendSwitch("disable-gpu");
+  }
+  if (gpuPrefs.disableBlendFuncExtended) {
+    app.commandLine.appendSwitch("disable-blend-func-extended");
+  }
+  if (gpuPrefs.useAngle) {
+    app.commandLine.appendSwitch("use-angle", gpuPrefs.useAngle);
+  }
+}
+loadGpuPrefs();
+
 // Silence noisy DevTools Autofill CDP errors (Electron's backend doesn't expose this domain)
 app.on("web-contents-created", (_event, contents) => {
   if (contents.getType() !== "devtools") return;
@@ -615,6 +660,24 @@ const registerBridges = (win) => {
     } catch {
       return { success: false, entries: [] };
     }
+  });
+
+  // GPU preferences handlers
+  ipcMain.handle("netcatty:gpu:getPreferences", async () => {
+    return { ...gpuPrefs };
+  });
+
+  ipcMain.handle("netcatty:gpu:setPreferences", async (_event, prefs) => {
+    gpuPrefs = { ...gpuPrefs, ...prefs };
+    saveGpuPrefs();
+    return { success: true };
+  });
+
+  ipcMain.handle("netcatty:gpu:applyPreferences", async (_event, prefs) => {
+    gpuPrefs = { ...gpuPrefs, ...prefs };
+    saveGpuPrefs();
+    // Note: these switches take effect on the NEXT launch.
+    return { success: true, note: "Changes will take full effect after restarting the app." };
   });
 
   // Settings window handler

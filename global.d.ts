@@ -489,6 +489,30 @@ declare global {
     // App info (name/version/platform) for About screens
     getAppInfo?(): Promise<{ name: string; version: string; platform: string }>;
 
+    // Database bridge
+    db?: {
+      listConfigs(): Promise<unknown>;
+      testConnection(config: unknown): Promise<unknown>;
+      saveConfig(config: unknown): Promise<unknown>;
+      deleteConfig(configId: string): Promise<unknown>;
+      connect(configId: string): Promise<unknown>;
+      connectWithConfig(config: unknown): Promise<unknown>;
+      disconnect(sessionId: string): Promise<unknown>;
+      getStatus(sessionId: string): Promise<unknown>;
+      execute(sessionId: string, queryOrCommand: string | string[], params?: unknown[]): Promise<unknown>;
+      getSchema(sessionId: string, database?: string): Promise<unknown>;
+      getObjectDetails(sessionId: string, selection: unknown): Promise<unknown>;
+      queryTableData(sessionId: string, selection: unknown, page?: number, pageSize?: number): Promise<unknown>;
+      listObjects(sessionId: string, type?: string): Promise<unknown>;
+      onStatusChange(cb: (payload: unknown) => void): () => void;
+      onError(cb: (payload: unknown) => void): () => void;
+    };
+
+    // GPU preferences
+    getGpuPreferences?(): Promise<GpuPreferences>;
+    setGpuPreferences?(prefs: Partial<GpuPreferences>): Promise<{ success: boolean }>;
+    applyGpuPreferences?(prefs: Partial<GpuPreferences>): Promise<{ success: boolean; note?: string }>;
+
     // Notify main process the renderer has mounted/painted (used to avoid initial blank screen).
     rendererReady?(): void;
 
@@ -862,6 +886,13 @@ declare global {
         hostId?: string;
       }>;
     }) => void): () => void;
+  }
+
+  // GPU preferences shape persisted in userData
+  interface GpuPreferences {
+    disableGpu?: boolean;
+    disableBlendFuncExtended?: boolean;
+    useAngle?: string;
   }
 
   interface Window {

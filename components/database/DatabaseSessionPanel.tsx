@@ -5,8 +5,9 @@ import type { DatabaseConfig, DatabaseSession, QueryResult } from "../../domain/
 import type { DatabaseObjectSelection, DatabaseResultView } from "../../domain/databaseSchemaView";
 import {
   buildDatabaseInspectorSections,
+  buildPreviewQueryTemplateForSelection,
   buildQueryTemplateForSelection,
-  getDefaultDatabaseSelection,
+  findDatabaseTable,
   normalizeDatabaseQueryResult,
   normalizeDatabaseSchema,
 } from "../../domain/databaseSchemaView";
@@ -28,12 +29,34 @@ interface DatabaseSessionPanelProps {
   schema?: unknown;
   onDisconnect: () => void;
   onExecuteQuery: (query: string) => Promise<QueryResult>;
+  onLoadObjectDetails: (selection: DatabaseObjectSelection) => Promise<unknown> | void;
+  onQueryTableData?: (
+    selection: DatabaseObjectSelection,
+    page: number,
+    pageSize: number,
+  ) => Promise<unknown> | void;
+  onLoadSchemaDatabase?: (databaseName: string) => Promise<unknown> | void;
   onRefreshSchema: () => Promise<unknown> | void;
 }
 
 type SessionView = "data" | "structure" | "query";
 
 const MAX_QUERY_LENGTH = 10000;
+const PREVIEW_PAGE_SIZE = 100;
+
+interface PreviewPaginationState {
+  page: number;
+  pageSize: number;
+  totalRows?: number;
+  totalRowsEstimated?: boolean;
+  hasMore: boolean;
+}
+
+interface PreviewCacheEntry {
+  result: DatabaseResultView;
+  pagination: PreviewPaginationState;
+  query: string;
+}
 
 const INSPECTOR_SECTION_TITLES: Record<string, string> = {
   connection: "database.connection",
@@ -101,37 +124,198 @@ const DatabaseSessionPanel: React.FC<DatabaseSessionPanelProps> = ({
   schema,
   onDisconnect,
   onExecuteQuery,
+  onLoadObjectDetails,
+  onQueryTableData,
+  onLoadSchemaDatabase,
   onRefreshSchema,
 }) => {
   const { t } = useI18n();
   const editorRef = useRef<HTMLTextAreaElement>(null);
-  const normalizedSchema = useMemo(() => normalizeDatabaseSchema(schema), [schema]);
+  const previewRequestIdRef = useRef(0);
+  const schemaLoadError = useMemo(() => {
+    if (
+      schema &&
+      typeof schema === "object" &&
+      "ok" in schema &&
+      (schema as { ok?: boolean }).ok === false
+    ) {
+      return typeof (schema as { error?: string }).error === "string"
+        ? (schema as { error?: string }).error
+        : t("database.error");
+    }
+    return null;
+  }, [schema, t]);
+  const normalizedSchema = useMemo(
+    () => normalizeDatabaseSchema(schemaLoadError ? undefined : schema),
+    [schema, schemaLoadError],
+  );
   const [activeView, setActiveView] = useState<SessionView>("data");
   const [schemaSearch, setSchemaSearch] = useState("");
   const [selectedObject, setSelectedObject] = useState<DatabaseObjectSelection | null>(null);
   const [query, setQuery] = useState("");
   const [suggestedQuery, setSuggestedQuery] = useState("");
+  const [previewPage, setPreviewPage] = useState(1);
+  const [previewCache, setPreviewCache] = useState<Record<string, PreviewCacheEntry>>({});
   const [previewResult, setPreviewResult] = useState<DatabaseResultView | null>(null);
+  const [previewPagination, setPreviewPagination] = useState<PreviewPaginationState | null>(null);
+  const [previewQueryText, setPreviewQueryText] = useState<string | null>(null);
   const [queryResult, setQueryResult] = useState<DatabaseResultView | null>(null);
   const [isLoadingPreview, setIsLoadingPreview] = useState(false);
   const [isExecutingQuery, setIsExecutingQuery] = useState(false);
+  const [loadingObjectDetailsId, setLoadingObjectDetailsId] = useState<string | null>(null);
+  const [objectDetailsErrors, setObjectDetailsErrors] = useState<Record<string, string>>({});
+  const [loadingSchemaNames, setLoadingSchemaNames] = useState<string[]>([]);
 
   const inspectorSections = useMemo(
     () => buildDatabaseInspectorSections(schema, config, selectedObject),
     [config, schema, selectedObject],
   );
   const previewTemplate = useMemo(
-    () => buildQueryTemplateForSelection(selectedObject, schema, config.driver),
-    [config.driver, schema, selectedObject],
+    () =>
+      buildPreviewQueryTemplateForSelection(selectedObject, schema, config.driver, {
+        page: previewPage,
+        pageSize: PREVIEW_PAGE_SIZE,
+      }),
+    [config.driver, previewPage, schema, selectedObject],
   );
   const latestLatency = queryResult?.durationMs ?? previewResult?.durationMs;
   const activeQueryCount = Number(isLoadingPreview) + Number(isExecutingQuery);
+  const selectedTable = useMemo(
+    () => findDatabaseTable(schema, selectedObject),
+    [schema, selectedObject],
+  );
+  const selectedObjectCacheKey = selectedObject ? `${session.id}:${selectedObject.id}` : null;
+  const selectedPreviewCacheKey = selectedObject
+    ? `${session.id}:${selectedObject.id}:page:${previewPage}`
+    : null;
+  const isLoadingObjectDetails =
+    Boolean(selectedObjectCacheKey) &&
+    loadingObjectDetailsId === selectedObjectCacheKey &&
+    !!selectedTable &&
+    !selectedTable.columnsLoaded;
+  const objectDetailsError = selectedObjectCacheKey
+    ? objectDetailsErrors[selectedObjectCacheKey]
+    : undefined;
+
+  useEffect(() => {
+    if (
+      activeView !== "structure" ||
+      !selectedObject ||
+      (selectedObject.kind !== "table" && selectedObject.kind !== "view")
+    ) {
+      return;
+    }
+
+    const selectedTableDetails = findDatabaseTable(schema, selectedObject);
+    if (selectedTableDetails?.columnsLoaded) {
+      return;
+    }
+
+    const cacheKey = `${session.id}:${selectedObject.id}`;
+    let cancelled = false;
+
+    setLoadingObjectDetailsId(cacheKey);
+    setObjectDetailsErrors((prev) => {
+      if (!(cacheKey in prev)) return prev;
+      const next = { ...prev };
+      delete next[cacheKey];
+      return next;
+    });
+
+    void Promise.resolve(onLoadObjectDetails(selectedObject))
+      .then((result) => {
+        if (cancelled) return;
+
+        const response =
+          result && typeof result === "object"
+            ? (result as { ok?: boolean; error?: string })
+            : null;
+        if (response?.ok === false) {
+          const error =
+            typeof response.error === "string" ? response.error : t("database.error");
+          setObjectDetailsErrors((prev) => ({
+            ...prev,
+            [cacheKey]: error,
+          }));
+          return;
+        }
+
+        setObjectDetailsErrors((prev) => {
+          if (!(cacheKey in prev)) return prev;
+          const next = { ...prev };
+          delete next[cacheKey];
+          return next;
+        });
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setObjectDetailsErrors((prev) => ({
+          ...prev,
+          [cacheKey]: String(err),
+        }));
+      })
+      .finally(() => {
+        if (cancelled) return;
+        setLoadingObjectDetailsId((current) => (current === cacheKey ? null : current));
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeView, onLoadObjectDetails, schema, selectedObject, session.id, t]);
+
+  const normalizePreviewPagination = useCallback(
+    (rawResult: unknown, page: number): PreviewPaginationState => {
+      const raw =
+        rawResult && typeof rawResult === "object"
+          ? (rawResult as {
+              page?: number;
+              pageSize?: number;
+              totalRows?: number;
+              totalRowsEstimated?: boolean;
+              hasMore?: boolean;
+            })
+          : {};
+
+      const resolvedPage =
+        typeof raw.page === "number" && raw.page > 0 ? raw.page : page;
+      const resolvedPageSize =
+        typeof raw.pageSize === "number" && raw.pageSize > 0
+          ? raw.pageSize
+          : PREVIEW_PAGE_SIZE;
+
+      return {
+        page: resolvedPage,
+        pageSize: resolvedPageSize,
+        totalRows:
+          typeof raw.totalRows === "number" && raw.totalRows >= 0
+            ? raw.totalRows
+            : undefined,
+        totalRowsEstimated: raw.totalRowsEstimated === true,
+        hasMore: raw.hasMore === true,
+      };
+    },
+    [],
+  );
+
+  const supportsPagedPreview = Boolean(
+    onQueryTableData &&
+    config.driver === "mysql" &&
+    selectedObject &&
+    (selectedObject.kind === "table" || selectedObject.kind === "view"),
+  );
 
   const executeStatement = useCallback(
-    async (statement: string, target: "preview" | "query") => {
+    async (
+      statement: string,
+      target: "preview" | "query",
+      previewRequestId?: number,
+    ) => {
       const trimmedQuery = statement.trim();
       const command = getCommandLabel(trimmedQuery);
       if (!trimmedQuery) return null;
+      const canUpdatePreview = () =>
+        previewRequestId === undefined || previewRequestIdRef.current === previewRequestId;
 
       if (trimmedQuery.length > MAX_QUERY_LENGTH) {
         const tooLong = normalizeDatabaseQueryResult({
@@ -139,12 +323,12 @@ const DatabaseSessionPanel: React.FC<DatabaseSessionPanelProps> = ({
           durationMs: 0,
           error: t("database.queryTooLong"),
         });
-        if (target === "preview") setPreviewResult(tooLong);
+        if (target === "preview" && canUpdatePreview()) setPreviewResult(tooLong);
         else setQueryResult(tooLong);
         return tooLong;
       }
 
-      if (target === "preview") setIsLoadingPreview(true);
+      if (target === "preview" && canUpdatePreview()) setIsLoadingPreview(true);
       else setIsExecutingQuery(true);
 
       const startTime = Date.now();
@@ -153,7 +337,7 @@ const DatabaseSessionPanel: React.FC<DatabaseSessionPanelProps> = ({
         const normalized = normalizeDatabaseQueryResult(
           toResultInput(rawResult, command, Date.now() - startTime),
         );
-        if (target === "preview") setPreviewResult(normalized);
+        if (target === "preview" && canUpdatePreview()) setPreviewResult(normalized);
         else setQueryResult(normalized);
         return normalized;
       } catch (err) {
@@ -162,33 +346,167 @@ const DatabaseSessionPanel: React.FC<DatabaseSessionPanelProps> = ({
           durationMs: Date.now() - startTime,
           error: String(err),
         });
-        if (target === "preview") setPreviewResult(normalized);
+        if (target === "preview" && canUpdatePreview()) setPreviewResult(normalized);
         else setQueryResult(normalized);
         return normalized;
       } finally {
-        if (target === "preview") setIsLoadingPreview(false);
+        if (target === "preview" && canUpdatePreview()) setIsLoadingPreview(false);
         else setIsExecutingQuery(false);
       }
     },
     [onExecuteQuery, t],
   );
 
+  const loadPreviewPage = useCallback(
+    (selection: DatabaseObjectSelection, page: number, forceRefresh = false) => {
+      const targetPage = Math.max(1, page);
+      const previewRequestId = previewRequestIdRef.current + 1;
+      previewRequestIdRef.current = previewRequestId;
+
+      setPreviewPage(targetPage);
+
+      void (async () => {
+        const isPagedPreview =
+          Boolean(onQueryTableData) &&
+          config.driver === "mysql" &&
+          (selection.kind === "table" || selection.kind === "view");
+
+        const template = buildPreviewQueryTemplateForSelection(
+          selection,
+          schema,
+          config.driver,
+          {
+            page: targetPage,
+            pageSize: PREVIEW_PAGE_SIZE,
+          },
+        );
+
+        if (!template) {
+          setPreviewResult(null);
+          setPreviewPagination(null);
+          setPreviewQueryText(null);
+          return;
+        }
+
+        setSuggestedQuery(template.query);
+        setQuery((current) =>
+          !current.trim() || current === suggestedQuery ? template.query : current,
+        );
+
+        const cacheKey = `${session.id}:${selection.id}:page:${targetPage}`;
+        if (!forceRefresh) {
+          const cachedPreview = previewCache[cacheKey];
+          if (cachedPreview) {
+            setPreviewResult(cachedPreview.result);
+            setPreviewPagination(cachedPreview.pagination);
+            setPreviewQueryText(cachedPreview.query);
+            return;
+          }
+        }
+
+        setPreviewResult(null);
+        setPreviewQueryText(template.query);
+
+        if (!isPagedPreview) {
+          setPreviewPagination(null);
+          const result = await executeStatement(template.query, "preview", previewRequestId);
+          if (!result || previewRequestIdRef.current !== previewRequestId) {
+            return;
+          }
+
+          const pagination = {
+            page: targetPage,
+            pageSize: PREVIEW_PAGE_SIZE,
+            totalRows: result.rowCount,
+            totalRowsEstimated: false,
+            hasMore: false,
+          } satisfies PreviewPaginationState;
+
+          setPreviewPagination(pagination);
+          setPreviewCache((prev) => ({
+            ...prev,
+            [cacheKey]: {
+              result,
+              pagination,
+              query: template.query,
+            },
+          }));
+          return;
+        }
+
+        setIsLoadingPreview(true);
+        try {
+          const rawResult = await onQueryTableData?.(selection, targetPage, PREVIEW_PAGE_SIZE);
+          if (previewRequestIdRef.current !== previewRequestId) {
+            return;
+          }
+
+          const normalized = normalizeDatabaseQueryResult(
+            toResultInput(rawResult, getCommandLabel(template.query), 0),
+          );
+          const pagination = normalizePreviewPagination(rawResult, targetPage);
+          const queryText =
+            rawResult &&
+            typeof rawResult === "object" &&
+            "query" in rawResult &&
+            typeof (rawResult as { query?: string }).query === "string"
+              ? (rawResult as { query?: string }).query || template.query
+              : template.query;
+
+          setPreviewResult(normalized);
+          setPreviewPagination(pagination);
+          setPreviewQueryText(queryText);
+          setPreviewCache((prev) => ({
+            ...prev,
+            [cacheKey]: {
+              result: normalized,
+              pagination,
+              query: queryText,
+            },
+          }));
+        } catch (err) {
+          if (previewRequestIdRef.current !== previewRequestId) {
+            return;
+          }
+
+          const normalized = normalizeDatabaseQueryResult({
+            command: getCommandLabel(template.query),
+            durationMs: 0,
+            error: String(err),
+          });
+          setPreviewResult(normalized);
+          setPreviewPagination({
+            page: targetPage,
+            pageSize: PREVIEW_PAGE_SIZE,
+            hasMore: false,
+          });
+          setPreviewQueryText(template.query);
+        } finally {
+          if (previewRequestIdRef.current === previewRequestId) {
+            setIsLoadingPreview(false);
+          }
+        }
+      })();
+    },
+    [
+      config.driver,
+      executeStatement,
+      normalizePreviewPagination,
+      onQueryTableData,
+      previewCache,
+      schema,
+      session.id,
+      suggestedQuery,
+    ],
+  );
+
   const handleOpenObject = useCallback(
     (selection: DatabaseObjectSelection) => {
       setSelectedObject(selection);
       setActiveView("data");
-      const template = buildQueryTemplateForSelection(selection, schema, config.driver);
-      if (!template) {
-        setPreviewResult(null);
-        return;
-      }
-      setSuggestedQuery(template.query);
-      setQuery((current) =>
-        !current.trim() || current === suggestedQuery ? template.query : current,
-      );
-      void executeStatement(template.query, "preview");
+      loadPreviewPage(selection, 1);
     },
-    [config.driver, executeStatement, schema, suggestedQuery],
+    [loadPreviewPage],
   );
 
   const handleOpenQuery = useCallback(
@@ -204,28 +522,52 @@ const DatabaseSessionPanel: React.FC<DatabaseSessionPanelProps> = ({
     [config.driver, schema],
   );
 
-  useEffect(() => {
-    if (!schema || selectedObject) return;
-    const defaultSelection = getDefaultDatabaseSelection(schema);
-    if (defaultSelection) handleOpenObject(defaultSelection);
-  }, [handleOpenObject, schema, selectedObject]);
-
   const handleExecuteQuery = useCallback(() => {
     void executeStatement(query, "query");
   }, [executeStatement, query]);
 
   const handleUsePreviewQuery = useCallback(() => {
-    if (!previewTemplate) return;
-    setSuggestedQuery(previewTemplate.query);
-    setQuery(previewTemplate.query);
+    const queryText = previewQueryText || previewTemplate?.query;
+    if (!queryText) return;
+    setSuggestedQuery(queryText);
+    setQuery(queryText);
     setActiveView("query");
     queueMicrotask(() => editorRef.current?.focus());
-  }, [previewTemplate]);
+  }, [previewQueryText, previewTemplate]);
 
   const handleRefreshData = useCallback(() => {
-    if (!previewTemplate) return;
-    void executeStatement(previewTemplate.query, "preview");
-  }, [executeStatement, previewTemplate]);
+    if (!selectedObject || !selectedPreviewCacheKey) return;
+    setPreviewCache((prev) => {
+      if (!(selectedPreviewCacheKey in prev)) return prev;
+      const next = { ...prev };
+      delete next[selectedPreviewCacheKey];
+      return next;
+    });
+    loadPreviewPage(selectedObject, previewPage, true);
+  }, [loadPreviewPage, previewPage, selectedObject, selectedPreviewCacheKey]);
+
+  const handleChangePreviewPage = useCallback(
+    (page: number) => {
+      if (!selectedObject || page < 1 || isLoadingPreview) return;
+      loadPreviewPage(selectedObject, page);
+    },
+    [isLoadingPreview, loadPreviewPage, selectedObject],
+  );
+
+  const handleLoadSchemaDatabase = useCallback(
+    (databaseName: string) => {
+      if (!onLoadSchemaDatabase || !databaseName) return;
+
+      setLoadingSchemaNames((prev) =>
+        prev.includes(databaseName) ? prev : [...prev, databaseName],
+      );
+
+      void Promise.resolve(onLoadSchemaDatabase(databaseName)).finally(() => {
+        setLoadingSchemaNames((prev) => prev.filter((item) => item !== databaseName));
+      });
+    },
+    [onLoadSchemaDatabase],
+  );
 
   const handleKeyDown = useCallback(
     (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -310,16 +652,31 @@ const DatabaseSessionPanel: React.FC<DatabaseSessionPanelProps> = ({
   );
 
   const renderGridOrMessage = useCallback(
-    (result: DatabaseResultView | null, emptyTitle: string, emptyHint: string) => {
+    (
+      result: DatabaseResultView | null,
+      emptyTitle: string,
+      emptyHint: string,
+      options?: {
+        pagination?: PreviewPaginationState | null;
+        onPageChange?: (page: number) => void;
+        isPageLoading?: boolean;
+      },
+    ) => {
       if (result?.kind === "table") {
         return (
           <DatabaseResultsTable
             columns={result.columns}
             rows={result.rows}
             truncated={result.truncated}
-            totalRows={result.rowCount}
+            totalRows={options?.pagination?.totalRows ?? result.rowCount}
+            totalRowsEstimated={options?.pagination?.totalRowsEstimated}
             durationMs={result.durationMs}
             error={result.error}
+            page={options?.pagination?.page}
+            pageSize={options?.pagination?.pageSize}
+            hasMore={options?.pagination?.hasMore}
+            isPageLoading={options?.isPageLoading}
+            onPageChange={options?.onPageChange}
             onCopy={createCopyHandler(result)}
             onExport={() => handleExportResult(result)}
           />
@@ -333,6 +690,10 @@ const DatabaseSessionPanel: React.FC<DatabaseSessionPanelProps> = ({
   const selectedObjectLabel = selectedObject?.schemaName
     ? `${selectedObject.schemaName}.${selectedObject.name || selectedObject.label}`
     : selectedObject?.label || config.label;
+  const previewDisplayQuery =
+    previewQueryText?.replace(/\s+/g, " ") ||
+    previewTemplate?.query.replace(/\s+/g, " ") ||
+    t("database.noPreview");
 
   return (
     <div className="flex h-full flex-col bg-background">
@@ -400,11 +761,19 @@ const DatabaseSessionPanel: React.FC<DatabaseSessionPanelProps> = ({
               </div>
 
               <ScrollArea className="flex-1">
-                {schema ? (
+                {schemaLoadError ? (
+                  <div className="flex h-full items-center justify-center px-4">
+                    <div className="max-w-xs rounded-lg border border-destructive/30 bg-destructive/5 px-4 py-3 text-xs text-destructive">
+                      {schemaLoadError}
+                    </div>
+                  </div>
+                ) : schema ? (
                   <DatabaseSchemaTree
                     schema={schema}
                     searchQuery={schemaSearch}
                     selectedObjectId={selectedObject?.id || null}
+                    loadingSchemaNames={loadingSchemaNames}
+                    onExpandSchema={handleLoadSchemaDatabase}
                     onOpenObject={handleOpenObject}
                     onOpenQuery={handleOpenQuery}
                   />
@@ -427,7 +796,7 @@ const DatabaseSessionPanel: React.FC<DatabaseSessionPanelProps> = ({
                   <div className="min-w-0">
                     <div className="truncate text-sm font-semibold">{selectedObjectLabel}</div>
                     <div className="truncate text-[11px] text-muted-foreground">
-                      {previewTemplate?.query.replace(/\s+/g, " ") || t("database.noPreview")}
+                      {previewDisplayQuery}
                     </div>
                   </div>
                   <div className="flex-1" />
@@ -441,7 +810,25 @@ const DatabaseSessionPanel: React.FC<DatabaseSessionPanelProps> = ({
                   </Button>
                 </div>
                 <div className="min-h-0 flex-1 bg-muted/10">
-                  {renderGridOrMessage(previewResult, t("database.noPreview"), t("database.selectObjectHint"))}
+                  {isLoadingPreview && !previewResult ? (
+                    <div className="flex h-full items-center justify-center px-4 text-sm text-muted-foreground">
+                      <Loader2 size={16} className="mr-2 animate-spin" />
+                      {t("database.loadingPreview")}
+                    </div>
+                  ) : (
+                    renderGridOrMessage(
+                      previewResult,
+                      t("database.noPreview"),
+                      t("database.selectObjectHint"),
+                      supportsPagedPreview
+                        ? {
+                            pagination: previewPagination,
+                            onPageChange: handleChangePreviewPage,
+                            isPageLoading: isLoadingPreview,
+                          }
+                        : undefined,
+                    )
+                  )}
                 </div>
               </TabsContent>
 
@@ -452,6 +839,17 @@ const DatabaseSessionPanel: React.FC<DatabaseSessionPanelProps> = ({
                 </div>
                 <ScrollArea className="flex-1">
                   <div className="space-y-4 p-4">
+                    {objectDetailsError && (
+                      <div className="rounded-lg border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm text-destructive">
+                        {objectDetailsError}
+                      </div>
+                    )}
+                    {isLoadingObjectDetails && (
+                      <div className="flex items-center rounded-lg border border-border/60 bg-muted/20 px-4 py-3 text-sm text-muted-foreground">
+                        <Loader2 size={14} className="mr-2 animate-spin" />
+                        {t("database.loadingObjectDetails")}
+                      </div>
+                    )}
                     {inspectorSections.length > 0 ? inspectorSections.map((section) => (
                       <div key={section.id} className="rounded-lg border border-border/60 bg-muted/10">
                         <div className="border-b border-border/60 px-3 py-2 text-xs font-semibold uppercase tracking-[0.12em] text-muted-foreground">
@@ -480,11 +878,11 @@ const DatabaseSessionPanel: React.FC<DatabaseSessionPanelProps> = ({
                           </div>
                         )}
                       </div>
-                    )) : (
+                    )) : !isLoadingObjectDetails ? (
                       <div className="rounded-lg border border-dashed border-border/60 px-4 py-6 text-center text-sm text-muted-foreground">
                         {t("database.noStructure")}
                       </div>
-                    )}
+                    ) : null}
                   </div>
                 </ScrollArea>
               </TabsContent>

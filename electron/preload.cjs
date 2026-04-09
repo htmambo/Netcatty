@@ -878,6 +878,11 @@ const api = {
   // App info
   getAppInfo: () => ipcRenderer.invoke("netcatty:app:getInfo"),
 
+  // GPU preferences
+  getGpuPreferences: () => ipcRenderer.invoke("netcatty:gpu:getPreferences"),
+  setGpuPreferences: (prefs) => ipcRenderer.invoke("netcatty:gpu:setPreferences", prefs),
+  applyGpuPreferences: (prefs) => ipcRenderer.invoke("netcatty:gpu:applyPreferences", prefs),
+
   // Tell main process the renderer has mounted/painted (used to avoid initial blank screen).
   rendererReady: () => ipcRenderer.send("netcatty:renderer:ready"),
   
@@ -1356,7 +1361,17 @@ const api = {
       ipcRenderer.invoke("netcatty:db:execute", buildExecutePayload(sessionId, queryOrCommand, params)),
 
     // Schema
-    getSchema: (sessionId) => ipcRenderer.invoke("netcatty:db:getSchema", { sessionId }),
+    getSchema: (sessionId, database) =>
+      ipcRenderer.invoke("netcatty:db:getSchema", { sessionId, database }),
+    getObjectDetails: (sessionId, selection) =>
+      ipcRenderer.invoke("netcatty:db:getObjectDetails", { sessionId, selection }),
+    queryTableData: (sessionId, selection, page, pageSize) =>
+      ipcRenderer.invoke("netcatty:db:queryTableData", {
+        sessionId,
+        selection,
+        page,
+        pageSize,
+      }),
     listObjects: (sessionId, type) => ipcRenderer.invoke("netcatty:db:listObjects", { sessionId, type }),
 
     // Event listeners for connection status changes

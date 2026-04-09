@@ -317,6 +317,9 @@ const SettingsPageContent: React.FC<{ settings: SettingsState }> = ({ settings }
 
                     {mountedTabs.has("system") && (
                         <SettingsSystemTab
+                            gpuPreferences={settings.gpuPreferences}
+                            setGpuPreferences={settings.setGpuPreferences}
+                            applyGpuPreferences={settings.applyGpuPreferences}
                             sessionLogsEnabled={settings.sessionLogsEnabled}
                             setSessionLogsEnabled={settings.setSessionLogsEnabled}
                             sessionLogsDir={settings.sessionLogsDir}

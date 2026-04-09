@@ -29,6 +29,8 @@ export interface DatabaseExplorerNode {
   kind: DatabaseObjectKind;
   count?: number;
   secondary?: string;
+  expandable?: boolean;
+  loaded?: boolean;
   schemaName?: string;
   name?: string;
   children?: DatabaseExplorerNode[];
@@ -63,6 +65,18 @@ export interface DatabaseResultView {
   message?: string;
   rawText?: string;
 }
+
+export interface DatabaseObjectDetails {
+  columns?: ColumnInfo[];
+}
+
+export interface DatabasePreviewQueryOptions {
+  page?: number;
+  pageSize?: number;
+}
+
+const MYSQL_PREVIEW_LIMIT = 100;
+const MYSQL_PREVIEW_TEXT_LENGTH = 256;
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -117,6 +131,10 @@ const normalizeTable = (value: unknown): TableInfo => {
           ? table.database
           : undefined,
     columns: rawColumns.map(normalizeColumn),
+    columnsLoaded:
+      typeof table.columnsLoaded === "boolean"
+        ? table.columnsLoaded
+        : rawColumns.length > 0,
     rowCountEstimate:
       typeof table.rowCountEstimate === "number"
         ? table.rowCountEstimate
@@ -187,6 +205,9 @@ export const normalizeDatabaseSchema = (value: unknown): DatabaseSchema => {
     .filter(({ table }) => table.name);
   const explicitViews = rawViews.map(normalizeTable).filter((table) => table.name);
   const explicitViewIds = new Set(explicitViews.map(getTableIdentity));
+  const loadedDatabases = Array.isArray(raw.loadedDatabases)
+    ? raw.loadedDatabases.filter((item): item is string => typeof item === "string")
+    : undefined;
 
   return {
     driver,
@@ -197,6 +218,7 @@ export const normalizeDatabaseSchema = (value: unknown): DatabaseSchema => {
           ? raw.version
           : "unknown",
     databases: databases ?? keyspaces?.map((item) => item.name),
+    loadedDatabases,
     keyspaces,
     sampledKeyTypes,
     sampledKeyCount:
@@ -233,6 +255,14 @@ export const buildDatabaseExplorerSections = (
   const schema = normalizeDatabaseSchema(schemaInput);
   const query = searchQuery.trim().toLowerCase();
   const sections: DatabaseExplorerSection[] = [];
+  const loadedDatabases = new Set(
+    schema.loadedDatabases && schema.loadedDatabases.length > 0
+      ? schema.loadedDatabases
+      : [
+          ...schema.tables.map((table) => table.schema).filter((item): item is string => Boolean(item)),
+          ...schema.views.map((view) => view.schema).filter((item): item is string => Boolean(item)),
+        ],
+  );
 
   const groupTables = (tables: TableInfo[], kind: "table" | "view"): DatabaseExplorerNode[] => {
     const grouped = new Map<string, DatabaseExplorerNode[]>();
@@ -260,7 +290,9 @@ export const buildDatabaseExplorerSections = (
         secondary:
           table.rowCountEstimate !== undefined
             ? `${table.rowCountEstimate.toLocaleString()} rows`
-            : `${table.columns.length} cols`,
+            : table.columnsLoaded
+              ? `${table.columns.length} cols`
+              : undefined,
       });
       grouped.set(schemaName, group);
     });
@@ -278,25 +310,78 @@ export const buildDatabaseExplorerSections = (
   };
 
   const tables = groupTables(schema.tables, "table");
-  if (tables.length > 0) {
-    sections.push({
-      id: "tables",
-      label: "tables",
-      kind: "group",
-      count: tables.reduce((sum, item) => sum + (item.count || item.children?.length || 0), 0),
-      items: tables,
-    });
-  }
-
   const views = groupTables(schema.views, "view");
-  if (views.length > 0) {
-    sections.push({
-      id: "views",
-      label: "views",
-      kind: "group",
-      count: views.reduce((sum, item) => sum + (item.count || item.children?.length || 0), 0),
-      items: views,
-    });
+  const shouldGroupByDatabase =
+    schema.driver === "mysql" &&
+    (schema.databases?.length || 0) > 0;
+
+  if (shouldGroupByDatabase) {
+    const tableGroups = new Map(
+      tables.map((item) => [item.name || item.label, item.children || []] as const),
+    );
+    const viewGroups = new Map(
+      views.map((item) => [item.name || item.label, item.children || []] as const),
+    );
+
+    const databaseNodes = (schema.databases || [])
+      .filter((databaseName) => {
+        const tableChildren = tableGroups.get(databaseName) || [];
+        const viewChildren = viewGroups.get(databaseName) || [];
+        if (!query) return true;
+        if (matchesSearch(query, [databaseName])) return true;
+        return [...tableChildren, ...viewChildren].some((child) =>
+          matchesSearch(query, [child.label, child.name, child.schemaName, child.secondary]),
+        );
+      })
+      .sort((left, right) => left.localeCompare(right))
+      .map<DatabaseExplorerNode>((databaseName) => {
+        const tableChildren = tableGroups.get(databaseName) || [];
+        const viewChildren = viewGroups.get(databaseName) || [];
+        const children = [...tableChildren, ...viewChildren].sort((left, right) =>
+          left.label.localeCompare(right.label),
+        );
+
+        return {
+          id: `schema:database:${databaseName}`,
+          label: databaseName,
+          kind: "schema",
+          name: databaseName,
+          count: children.length || undefined,
+          expandable: true,
+          loaded: loadedDatabases.has(databaseName),
+          children,
+        };
+      });
+
+    if (databaseNodes.length > 0) {
+      sections.push({
+        id: "databases",
+        label: "databases",
+        kind: "group",
+        count: databaseNodes.length,
+        items: databaseNodes,
+      });
+    }
+  } else {
+    if (tables.length > 0) {
+      sections.push({
+        id: "tables",
+        label: "tables",
+        kind: "group",
+        count: tables.reduce((sum, item) => sum + (item.count || item.children?.length || 0), 0),
+        items: tables,
+      });
+    }
+
+    if (views.length > 0) {
+      sections.push({
+        id: "views",
+        label: "views",
+        kind: "group",
+        count: views.reduce((sum, item) => sum + (item.count || item.children?.length || 0), 0),
+        items: views,
+      });
+    }
   }
 
   const collections = (schema.collections || [])
@@ -495,7 +580,7 @@ export const buildDatabaseInspectorSections = (
           { label: "Type", value: resolvedSelection.kind.toUpperCase() },
           { label: "Name", value: table.name },
           { label: "Schema", value: table.schema || "default" },
-          { label: "Columns", value: String(table.columns.length) },
+          { label: "Columns", value: table.columnsLoaded ? String(table.columns.length) : "-" },
           {
             label: "Rows",
             value:
@@ -508,7 +593,7 @@ export const buildDatabaseInspectorSections = (
       {
         id: "columns",
         title: "columns",
-        columns: table.columns,
+        columns: table.columnsLoaded ? table.columns : [],
       },
     ];
   }
@@ -571,10 +656,12 @@ export const buildQueryTemplateForSelection = (
 
   if (selection.kind === "table" || selection.kind === "view") {
     const table = findDatabaseTable(schemaInput, selection);
-    const objectName = table?.schema ? `${table.schema}.${table.name}` : table?.name || selection.label;
+    const objectName = table?.schema
+      ? `${quoteSqlIdentifier(driver, table.schema)}.${quoteSqlIdentifier(driver, table.name)}`
+      : quoteSqlIdentifier(driver, table?.name || selection.label);
     return {
       title: selection.label,
-      query: `SELECT *\nFROM ${objectName}\nLIMIT 200;`,
+      query: `SELECT *\nFROM ${objectName}\nLIMIT 100;`,
     };
   }
 
@@ -600,6 +687,90 @@ export const buildQueryTemplateForSelection = (
   }
 
   return null;
+};
+
+const MYSQL_GEOMETRY_TYPES = [
+  "geometry",
+  "point",
+  "linestring",
+  "polygon",
+  "multipoint",
+  "multilinestring",
+  "multipolygon",
+  "geometrycollection",
+];
+
+const buildMysqlPreviewColumnExpression = (column: ColumnInfo): string => {
+  const columnRef = quoteSqlIdentifier("mysql", column.name);
+  const alias = quoteSqlIdentifier("mysql", column.name);
+  const type = column.dataType.trim().toLowerCase();
+
+  if (
+    type.includes("blob") ||
+    type.includes("binary") ||
+    type.startsWith("bit")
+  ) {
+    return `CASE WHEN ${columnRef} IS NULL THEN NULL ELSE CONCAT('<binary ', OCTET_LENGTH(${columnRef}), ' bytes>') END AS ${alias}`;
+  }
+
+  if (MYSQL_GEOMETRY_TYPES.some((entry) => type.startsWith(entry))) {
+    return `CASE WHEN ${columnRef} IS NULL THEN NULL ELSE ST_AsText(${columnRef}) END AS ${alias}`;
+  }
+
+  if (type.includes("text") || type.startsWith("json")) {
+    return `CASE WHEN ${columnRef} IS NULL THEN NULL WHEN CHAR_LENGTH(CAST(${columnRef} AS CHAR)) > ${MYSQL_PREVIEW_TEXT_LENGTH} THEN CONCAT(LEFT(CAST(${columnRef} AS CHAR), ${MYSQL_PREVIEW_TEXT_LENGTH}), '...') ELSE CAST(${columnRef} AS CHAR) END AS ${alias}`;
+  }
+
+  return columnRef;
+};
+
+export const buildPreviewQueryTemplateForSelection = (
+  selection: DatabaseObjectSelection | null,
+  schemaInput: unknown,
+  driver: DatabaseDriver,
+  options?: DatabasePreviewQueryOptions,
+): { title: string; query: string } | null => {
+  if (!selection || (selection.kind !== "table" && selection.kind !== "view")) {
+    return buildQueryTemplateForSelection(selection, schemaInput, driver);
+  }
+
+  const page = Math.max(1, options?.page || 1);
+  const pageSize = Math.max(1, options?.pageSize || MYSQL_PREVIEW_LIMIT);
+  const offset = (page - 1) * pageSize;
+  const table = findDatabaseTable(schemaInput, selection);
+  const objectName = table?.schema
+    ? `${quoteSqlIdentifier(driver, table.schema)}.${quoteSqlIdentifier(driver, table.name)}`
+      : quoteSqlIdentifier(driver, table?.name || selection.label);
+
+  if (driver === "mysql" && table?.columnsLoaded && table.columns.length > 0) {
+    const selectList = table.columns
+      .map((column) => `  ${buildMysqlPreviewColumnExpression(column)}`)
+      .join(",\n");
+
+    return {
+      title: selection.label,
+      query: `SELECT\n${selectList}\nFROM ${objectName}\nLIMIT ${pageSize}${offset > 0 ? ` OFFSET ${offset}` : ""};`,
+    };
+  }
+
+  return {
+    title: selection.label,
+    query: `SELECT *\nFROM ${objectName}\nLIMIT ${pageSize}${offset > 0 ? ` OFFSET ${offset}` : ""};`,
+  };
+};
+
+const quoteSqlIdentifier = (driver: DatabaseDriver, identifier: string): string => {
+  if (!identifier) return identifier;
+
+  if (driver === "mysql") {
+    return `\`${identifier.replace(/`/g, "``")}\``;
+  }
+
+  if (driver === "postgresql") {
+    return `"${identifier.replace(/"/g, "\"\"")}"`;
+  }
+
+  return identifier;
 };
 
 const toText = (value: unknown): string => {
@@ -787,4 +958,95 @@ export const tokenizeDatabaseCommand = (text: string): string[] => {
   }
 
   return tokens;
+};
+
+export const applyDatabaseObjectDetails = (
+  schemaInput: unknown,
+  selection: DatabaseObjectSelection | null,
+  details: DatabaseObjectDetails,
+): unknown => {
+  if (!selection || (selection.kind !== "table" && selection.kind !== "view")) {
+    return schemaInput;
+  }
+
+  const wrapper = isRecord(schemaInput) ? { ...schemaInput } : {};
+  const hasWrappedSchema = isRecord(wrapper.schema);
+  const rawSchema = hasWrappedSchema ? { ...wrapper.schema } : { ...wrapper };
+  const collectionKey = selection.kind === "table" ? "tables" : "views";
+  const source = Array.isArray(rawSchema[collectionKey]) ? rawSchema[collectionKey] : [];
+
+  rawSchema[collectionKey] = source.map((entry) => {
+    if (!isRecord(entry)) return entry;
+
+    const entryName = typeof entry.name === "string" ? entry.name : "";
+    const entrySchema =
+      typeof entry.schema === "string"
+        ? entry.schema
+        : typeof entry.database === "string"
+          ? entry.database
+          : undefined;
+
+    if (
+      entryName !== selection.name ||
+      (selection.schemaName ? entrySchema !== selection.schemaName : false)
+    ) {
+      return entry;
+    }
+
+    return {
+      ...entry,
+      columns: details.columns ?? entry.columns ?? [],
+      columnsLoaded: Array.isArray(details.columns),
+    };
+  });
+
+  return hasWrappedSchema ? { ...wrapper, schema: rawSchema } : rawSchema;
+};
+
+export const mergeDatabaseSchema = (
+  currentSchemaInput: unknown,
+  nextSchemaInput: unknown,
+): unknown => {
+  const current = normalizeDatabaseSchema(currentSchemaInput);
+  const next = normalizeDatabaseSchema(nextSchemaInput);
+
+  const mergeTables = (left: TableInfo[], right: TableInfo[]): TableInfo[] => {
+    const merged = new Map<string, TableInfo>();
+
+    for (const table of left) {
+      merged.set(`${table.schema || ""}:${table.name}`, table);
+    }
+    for (const table of right) {
+      merged.set(`${table.schema || ""}:${table.name}`, table);
+    }
+
+    return [...merged.values()].sort((a, b) => {
+      const schemaCompare = (a.schema || "").localeCompare(b.schema || "");
+      if (schemaCompare !== 0) return schemaCompare;
+      return a.name.localeCompare(b.name);
+    });
+  };
+
+  return {
+    driver: next.driver || current.driver,
+    serverVersion:
+      next.serverVersion && next.serverVersion !== "unknown"
+        ? next.serverVersion
+        : current.serverVersion,
+    databases: Array.from(
+      new Set([...(current.databases || []), ...(next.databases || [])]),
+    ).sort((a, b) => a.localeCompare(b)),
+    loadedDatabases: Array.from(
+      new Set([...(current.loadedDatabases || []), ...(next.loadedDatabases || [])]),
+    ).sort((a, b) => a.localeCompare(b)),
+    tables: mergeTables(current.tables, next.tables),
+    views: mergeTables(current.views, next.views),
+    indexes: next.indexes.length > 0 ? next.indexes : current.indexes,
+    collections: next.collections || current.collections,
+    extensions: next.extensions || current.extensions,
+    sampledKeyTypes: next.sampledKeyTypes || current.sampledKeyTypes,
+    sampledKeyCount: next.sampledKeyCount ?? current.sampledKeyCount,
+    totalKeyCount: next.totalKeyCount ?? current.totalKeyCount,
+    keyspaces: next.keyspaces || current.keyspaces,
+  };
 };

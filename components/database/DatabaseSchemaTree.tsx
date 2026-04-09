@@ -16,15 +16,11 @@ import type {
 } from "../../domain/databaseSchemaView";
 import {
   buildDatabaseExplorerSections,
+  buildPreviewQueryTemplateForSelection,
   buildQueryTemplateForSelection,
   normalizeDatabaseSchema,
 } from "../../domain/databaseSchemaView";
 import { cn } from "../../lib/utils";
-import {
-  Collapsible,
-  CollapsibleContent,
-  CollapsibleTrigger,
-} from "../ui/collapsible";
 import {
   ContextMenu,
   ContextMenuContent,
@@ -36,9 +32,34 @@ interface DatabaseSchemaTreeProps {
   schema: unknown;
   searchQuery?: string;
   selectedObjectId?: string | null;
+  loadingSchemaNames?: string[];
+  onExpandSchema?: (schemaName: string) => void;
   onOpenObject: (selection: DatabaseObjectSelection) => void;
   onOpenQuery: (selection: DatabaseObjectSelection) => void;
 }
+
+const collectInitialExpandedIds = (
+  sections: ReturnType<typeof buildDatabaseExplorerSections>,
+  loadingSchemaNames: string[],
+): Set<string> => {
+  const next = new Set<string>();
+
+  sections.forEach((section) => {
+    next.add(section.id);
+    section.items.forEach((item) => {
+      if (item.kind !== "schema") return;
+
+      const hasChildren = Array.isArray(item.children) && item.children.length > 0;
+      const isLoading =
+        typeof item.name === "string" && loadingSchemaNames.includes(item.name);
+      if (hasChildren || isLoading) {
+        next.add(item.id);
+      }
+    });
+  });
+
+  return next;
+};
 
 const getNodeIcon = (kind: DatabaseExplorerNode["kind"]): React.ReactNode => {
   switch (kind) {
@@ -79,6 +100,8 @@ const DatabaseSchemaTree: React.FC<DatabaseSchemaTreeProps> = ({
   schema,
   searchQuery = "",
   selectedObjectId,
+  loadingSchemaNames = [],
+  onExpandSchema,
   onOpenObject,
   onOpenQuery,
 }) => {
@@ -88,40 +111,48 @@ const DatabaseSchemaTree: React.FC<DatabaseSchemaTreeProps> = ({
     () => buildDatabaseExplorerSections(schema, searchQuery),
     [schema, searchQuery],
   );
-  const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
+  const [expandedIds, setExpandedIds] = useState<Set<string>>(() =>
+    collectInitialExpandedIds(explorerSections, loadingSchemaNames),
+  );
 
   useEffect(() => {
     setExpandedIds((prev) => {
-      if (prev.size > 0) return prev;
+      const next = new Set(prev);
+      let changed = false;
 
-      const next = new Set<string>();
       explorerSections.forEach((section) => {
-        next.add(section.id);
-        section.items.forEach((item) => {
-          if (item.kind === "schema") {
-            next.add(item.id);
+        if (!next.has(section.id)) {
+          next.add(section.id);
+          changed = true;
+        }
+      });
+
+      if (prev.size === 0 || loadingSchemaNames.length > 0) {
+        const ensured = collectInitialExpandedIds(explorerSections, loadingSchemaNames);
+        ensured.forEach((id) => {
+          if (!next.has(id)) {
+            next.add(id);
+            changed = true;
           }
         });
-      });
-      return next;
-    });
-  }, [explorerSections]);
+      }
 
-  const toggleExpanded = useCallback((id: string) => {
+      return changed ? next : prev;
+    });
+  }, [explorerSections, loadingSchemaNames]);
+
+  const setExpanded = useCallback((id: string, open: boolean) => {
     setExpandedIds((prev) => {
       const next = new Set(prev);
-      if (next.has(id)) {
-        next.delete(id);
-      } else {
-        next.add(id);
-      }
+      if (open) next.add(id);
+      else next.delete(id);
       return next;
     });
   }, []);
 
   const copyPreviewQuery = useCallback(
     (selection: DatabaseObjectSelection) => {
-      const template = buildQueryTemplateForSelection(
+      const template = buildPreviewQueryTemplateForSelection(
         selection,
         schema,
         normalizedSchema.driver,
@@ -132,50 +163,82 @@ const DatabaseSchemaTree: React.FC<DatabaseSchemaTreeProps> = ({
     [normalizedSchema.driver, schema],
   );
 
+  const handleToggleNode = useCallback(
+    (node: DatabaseExplorerNode, open: boolean) => {
+      setExpanded(node.id, open);
+      if (
+        open &&
+        node.kind === "schema" &&
+        node.expandable &&
+        !node.loaded &&
+        typeof node.name === "string"
+      ) {
+        onExpandSchema?.(node.name);
+      }
+    },
+    [onExpandSchema, setExpanded],
+  );
+
   const renderNode = useCallback(
     (node: DatabaseExplorerNode, depth = 0): React.ReactNode => {
       const selection = buildSelectionFromNode(node);
       const hasChildren = Array.isArray(node.children) && node.children.length > 0;
+      const isExpandable = hasChildren || node.expandable === true;
       const isExpanded = expandedIds.has(node.id);
       const paddingLeft = 10 + depth * 16;
+      const isLoadingSchema =
+        node.kind === "schema" &&
+        typeof node.name === "string" &&
+        loadingSchemaNames.includes(node.name);
       const template = selection
         ? buildQueryTemplateForSelection(selection, schema, normalizedSchema.driver)
         : null;
 
-      if (hasChildren) {
+      if (isExpandable) {
         return (
-          <Collapsible
-            key={node.id}
-            open={isExpanded}
-            onOpenChange={() => toggleExpanded(node.id)}
-          >
-            <CollapsibleTrigger asChild>
-              <button
-                type="button"
-                className="flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-xs text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground"
-                style={{ paddingLeft: `${paddingLeft}px` }}
-              >
-                <ChevronRight
-                  size={12}
-                  className={cn("shrink-0 transition-transform", isExpanded && "rotate-90")}
-                />
-                {getNodeIcon(node.kind)}
-                <span className="truncate">
-                  {node.label === "default" ? t("database.defaultSchema") : node.label}
+          <div key={node.id}>
+            <button
+              type="button"
+              className="flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-xs text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground"
+              style={{ paddingLeft: `${paddingLeft}px` }}
+              onClick={() => handleToggleNode(node, !isExpanded)}
+            >
+              <ChevronRight
+                size={12}
+                className={cn("shrink-0 transition-transform", isExpanded && "rotate-90")}
+              />
+              {getNodeIcon(node.kind)}
+              <span className="truncate">
+                {node.label === "default" ? t("database.defaultSchema") : node.label}
+              </span>
+              {typeof node.count === "number" && (
+                <span className="ml-auto shrink-0 text-[10px] text-muted-foreground/80">
+                  {node.count}
                 </span>
-                {typeof node.count === "number" && (
-                  <span className="ml-auto shrink-0 text-[10px] text-muted-foreground/80">
-                    {node.count}
-                  </span>
-                )}
-              </button>
-            </CollapsibleTrigger>
-            <CollapsibleContent>
+              )}
+            </button>
+            {isExpanded ? (
               <div className="space-y-0.5 py-0.5">
-                {node.children?.map((child) => renderNode(child, depth + 1))}
+                {hasChildren ? node.children?.map((child) => renderNode(child, depth + 1)) : null}
+                {!hasChildren && isLoadingSchema ? (
+                  <div
+                    className="px-2 py-1 text-[11px] text-muted-foreground"
+                    style={{ paddingLeft: `${paddingLeft + 28}px` }}
+                  >
+                    {t("database.loadingSchema")}
+                  </div>
+                ) : null}
+                {!hasChildren && node.loaded && !isLoadingSchema ? (
+                  <div
+                    className="px-2 py-1 text-[11px] text-muted-foreground"
+                    style={{ paddingLeft: `${paddingLeft + 28}px` }}
+                  >
+                    {t("database.noObjectsAvailable")}
+                  </div>
+                ) : null}
               </div>
-            </CollapsibleContent>
-          </Collapsible>
+            ) : null}
+          </div>
         );
       }
 
@@ -239,27 +302,18 @@ const DatabaseSchemaTree: React.FC<DatabaseSchemaTreeProps> = ({
       copyPreviewQuery,
       expandedIds,
       normalizedSchema.driver,
+      handleToggleNode,
       onOpenObject,
       onOpenQuery,
       schema,
       selectedObjectId,
       t,
-      toggleExpanded,
+      loadingSchemaNames,
     ],
   );
 
   return (
-    <div className="space-y-3 px-2 py-2">
-      <div className="rounded-lg border border-border/60 bg-muted/20 px-2.5 py-2">
-        <div className="flex items-center gap-2 text-xs font-medium">
-          <Database size={13} className="text-muted-foreground" />
-          <span>{normalizedSchema.driver.toUpperCase()}</span>
-        </div>
-        <div className="mt-1 text-[11px] text-muted-foreground">
-          {normalizedSchema.serverVersion}
-        </div>
-      </div>
-
+    <div className="space-y-2 px-2 py-2">
       {explorerSections.length > 0 ? (
         <div className="space-y-2">
           {explorerSections.map((section) => (
