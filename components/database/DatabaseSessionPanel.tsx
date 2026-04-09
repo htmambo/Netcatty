@@ -743,12 +743,8 @@ const DatabaseSessionPanel: React.FC<DatabaseSessionPanelProps> = ({
       <div className="min-h-0 flex-1">
         <ResizablePanelGroup direction="horizontal" className="h-full">
           <ResizablePanel defaultSize={22} minSize={16} maxSize={34}>
-            <div className="flex h-full flex-col border-r border-border/60">
+            <div className="flex-1 h-full flex-col border-r border-border/60">
               <div className="border-b border-border/60 px-3 py-2">
-                <div className="mb-2 flex items-center gap-2 text-xs font-medium text-muted-foreground">
-                  <Search size={12} />
-                  <span>{t("database.objectExplorer")}</span>
-                </div>
                 <div className="relative">
                   <Search size={12} className="pointer-events-none absolute left-2 top-1/2 -translate-y-1/2 text-muted-foreground" />
                   <Input
