@@ -16,7 +16,7 @@ import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "../ui/resizable";
-import { ScrollArea } from "../ui/scroll-area";
+import { ScrollArea, ScrollBar } from "../ui/scroll-area";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "../ui/tabs";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "../ui/tooltip";
 import DatabaseResultsTable from "./DatabaseResultsTable";
@@ -741,22 +741,23 @@ const DatabaseSessionPanel: React.FC<DatabaseSessionPanelProps> = ({
       </div>
 
       <div className="min-h-0 flex-1">
-        <ResizablePanelGroup direction="horizontal" className="h-full">
-          <ResizablePanel defaultSize={22} minSize={16} maxSize={34}>
-            <div className="flex-1 h-full flex-col border-r border-border/60">
-              <div className="border-b border-border/60 px-3 py-2">
-                <div className="relative">
-                  <Search size={12} className="pointer-events-none absolute left-2 top-1/2 -translate-y-1/2 text-muted-foreground" />
-                  <Input
-                    value={schemaSearch}
-                    onChange={(event) => setSchemaSearch(event.target.value)}
-                    placeholder={t("database.filterObjects")}
-                    className="h-8 pl-7 text-xs"
-                  />
-                </div>
+        <div className="flex h-full">
+          {/* Left sidebar: fixed 220px */}
+          <div className="flex h-full w-[220px] shrink-0 flex-col border-r border-border/60">
+            <div className="border-b border-border/60 px-3 py-2">
+              <div className="relative">
+                <Search size={12} className="pointer-events-none absolute left-2 top-1/2 -translate-y-1/2 text-muted-foreground" />
+                <Input
+                  value={schemaSearch}
+                  onChange={(event) => setSchemaSearch(event.target.value)}
+                  placeholder={t("database.filterObjects")}
+                  className="h-8 pl-7 text-xs"
+                />
               </div>
+            </div>
 
-              <ScrollArea className="flex-1">
+            <ScrollArea className="flex-1">
+              <div className="min-w-[220px]">
                 {schemaLoadError ? (
                   <div className="flex h-full items-center justify-center px-4">
                     <div className="max-w-xs rounded-lg border border-destructive/30 bg-destructive/5 px-4 py-3 text-xs text-destructive">
@@ -779,15 +780,16 @@ const DatabaseSessionPanel: React.FC<DatabaseSessionPanelProps> = ({
                     {t("database.loadingSchema")}
                   </div>
                 )}
-              </ScrollArea>
-            </div>
-          </ResizablePanel>
+              </div>
+              <ScrollBar orientation="vertical" />
+              <ScrollBar orientation="horizontal" />
+            </ScrollArea>
+          </div>
 
-          <ResizableHandle withHandle />
-
-          <ResizablePanel defaultSize={78}>
-            <Tabs value={activeView} onValueChange={(value) => setActiveView(value as SessionView)} className="flex h-full flex-col">
-              <TabsContent value="data" className="mt-0 flex min-h-0 flex-1 flex-col">
+          {/* Right preview area: takes remaining space */}
+          <div className="min-w-0 flex-1">
+            <Tabs value={activeView} onValueChange={(value) => setActiveView(value as SessionView)} className="flex h-full w-full flex-col">
+              <TabsContent value="data" className="mt-0 flex min-h-0 w-full flex-1 flex-col">
                 <div className="flex items-center gap-2 border-b border-border/60 px-3 py-2">
                   <div className="min-w-0">
                     <div className="truncate text-sm font-semibold">{selectedObjectLabel}</div>
@@ -828,7 +830,7 @@ const DatabaseSessionPanel: React.FC<DatabaseSessionPanelProps> = ({
                 </div>
               </TabsContent>
 
-              <TabsContent value="structure" className="mt-0 flex min-h-0 flex-1 flex-col">
+              <TabsContent value="structure" className="mt-0 flex min-h-0 w-full flex-1 flex-col">
                 <div className="border-b border-border/60 px-3 py-2">
                   <div className="truncate text-sm font-semibold">{selectedObjectLabel}</div>
                   <div className="text-[11px] text-muted-foreground">{t("database.structure")}</div>
@@ -884,7 +886,7 @@ const DatabaseSessionPanel: React.FC<DatabaseSessionPanelProps> = ({
               </TabsContent>
 
               <TabsContent value="query" className="mt-0 flex min-h-0 flex-1 flex-col">
-                <ResizablePanelGroup direction="vertical" className="h-full">
+                <ResizablePanelGroup direction="vertical" className="h-full w-full">
                   <ResizablePanel defaultSize={42} minSize={20}>
                     <div className="flex h-full flex-col">
                       <div className="flex items-center gap-2 border-b border-border/60 px-3 py-2">
@@ -931,8 +933,8 @@ const DatabaseSessionPanel: React.FC<DatabaseSessionPanelProps> = ({
                 </ResizablePanelGroup>
               </TabsContent>
             </Tabs>
-          </ResizablePanel>
-        </ResizablePanelGroup>
+          </div>
+        </div>
       </div>
 
       <DatabaseStatusBar
