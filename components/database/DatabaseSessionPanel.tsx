@@ -34,6 +34,7 @@ interface DatabaseSessionPanelProps {
     selection: DatabaseObjectSelection,
     page: number,
     pageSize: number,
+    sort?: { column: string; direction: "asc" | "desc" } | null,
   ) => Promise<unknown> | void;
   onLoadSchemaDatabase?: (databaseName: string) => Promise<unknown> | void;
   onRefreshSchema: () => Promise<unknown> | void;
@@ -132,6 +133,7 @@ const DatabaseSessionPanel: React.FC<DatabaseSessionPanelProps> = ({
   const { t } = useI18n();
   const editorRef = useRef<HTMLTextAreaElement>(null);
   const previewRequestIdRef = useRef(0);
+  const previewSortRef = useRef<{ column: string; dir: "asc" | "desc" } | null>(null);
   const schemaLoadError = useMemo(() => {
     if (
       schema &&
@@ -155,6 +157,7 @@ const DatabaseSessionPanel: React.FC<DatabaseSessionPanelProps> = ({
   const [query, setQuery] = useState("");
   const [suggestedQuery, setSuggestedQuery] = useState("");
   const [previewPage, setPreviewPage] = useState(1);
+  const [previewSort, setPreviewSort] = useState<{ column: string; dir: "asc" | "desc" } | null>(null);
   const [previewCache, setPreviewCache] = useState<Record<string, PreviewCacheEntry>>({});
   const [previewResult, setPreviewResult] = useState<DatabaseResultView | null>(null);
   const [previewPagination, setPreviewPagination] = useState<PreviewPaginationState | null>(null);
@@ -364,8 +367,11 @@ const DatabaseSessionPanel: React.FC<DatabaseSessionPanelProps> = ({
       previewRequestIdRef.current = previewRequestId;
 
       setPreviewPage(targetPage);
+      setIsLoadingPreview(true);
+      setPreviewResult(null);
 
-      void (async () => {
+      // Defer so React can paint the loading state before heavy work
+      const doLoad = async () => {
         const isPagedPreview =
           Boolean(onQueryTableData) &&
           config.driver === "mysql" &&
@@ -382,7 +388,7 @@ const DatabaseSessionPanel: React.FC<DatabaseSessionPanelProps> = ({
         );
 
         if (!template) {
-          setPreviewResult(null);
+          setIsLoadingPreview(false);
           setPreviewPagination(null);
           setPreviewQueryText(null);
           return;
@@ -393,10 +399,12 @@ const DatabaseSessionPanel: React.FC<DatabaseSessionPanelProps> = ({
           !current.trim() || current === suggestedQuery ? template.query : current,
         );
 
-        const cacheKey = `${session.id}:${selection.id}:page:${targetPage}`;
+        const sortKey = previewSortRef.current ? `:sort:${previewSortRef.current.column}:${previewSortRef.current.dir}` : "";
+        const cacheKey = `${session.id}:${selection.id}:page:${targetPage}${sortKey}`;
         if (!forceRefresh) {
           const cachedPreview = previewCache[cacheKey];
           if (cachedPreview) {
+            setIsLoadingPreview(false);
             setPreviewResult(cachedPreview.result);
             setPreviewPagination(cachedPreview.pagination);
             setPreviewQueryText(cachedPreview.query);
@@ -404,7 +412,6 @@ const DatabaseSessionPanel: React.FC<DatabaseSessionPanelProps> = ({
           }
         }
 
-        setPreviewResult(null);
         setPreviewQueryText(template.query);
 
         if (!isPagedPreview) {
@@ -434,9 +441,11 @@ const DatabaseSessionPanel: React.FC<DatabaseSessionPanelProps> = ({
           return;
         }
 
-        setIsLoadingPreview(true);
         try {
-          const rawResult = await onQueryTableData?.(selection, targetPage, PREVIEW_PAGE_SIZE);
+          const sortPayload = previewSortRef.current
+            ? { column: previewSortRef.current.column, direction: previewSortRef.current.dir }
+            : null;
+          const rawResult = await onQueryTableData?.(selection, targetPage, PREVIEW_PAGE_SIZE, sortPayload);
           if (previewRequestIdRef.current !== previewRequestId) {
             return;
           }
@@ -486,7 +495,9 @@ const DatabaseSessionPanel: React.FC<DatabaseSessionPanelProps> = ({
             setIsLoadingPreview(false);
           }
         }
-      })();
+      };
+
+      void setTimeout(() => void doLoad(), 0);
     },
     [
       config.driver,
@@ -504,6 +515,10 @@ const DatabaseSessionPanel: React.FC<DatabaseSessionPanelProps> = ({
     (selection: DatabaseObjectSelection) => {
       setSelectedObject(selection);
       setActiveView("data");
+      setPreviewSort(null);
+      previewSortRef.current = null;
+      setPreviewPage(1);
+      setPreviewCache({});
       loadPreviewPage(selection, 1);
     },
     [loadPreviewPage],
@@ -553,6 +568,29 @@ const DatabaseSessionPanel: React.FC<DatabaseSessionPanelProps> = ({
     },
     [isLoadingPreview, loadPreviewPage, selectedObject],
   );
+
+  useEffect(() => {
+    if (!selectedObject) return;
+    loadPreviewPage(selectedObject, 1);
+  }, [selectedObject, previewSort]);
+
+  const handleSortChange = useCallback((column: string) => {
+    if (!selectedObject) return;
+    setPreviewPage(1);
+    setPreviewCache({});
+    setPreviewSort((prev) => {
+      let next: { column: string; dir: "asc" | "desc" } | null;
+      if (prev?.column !== column) {
+        next = { column, dir: "asc" };
+      } else if (prev.dir === "asc") {
+        next = { column, dir: "desc" };
+      } else {
+        next = null;
+      }
+      previewSortRef.current = next;
+      return next;
+    });
+  }, [selectedObject]);
 
   const handleLoadSchemaDatabase = useCallback(
     (databaseName: string) => {
@@ -660,6 +698,9 @@ const DatabaseSessionPanel: React.FC<DatabaseSessionPanelProps> = ({
         pagination?: PreviewPaginationState | null;
         onPageChange?: (page: number) => void;
         isPageLoading?: boolean;
+        sortColumn?: string | null;
+        sortDirection?: "asc" | "desc" | null;
+        onSortChange?: (column: string) => void;
       },
     ) => {
       if (result?.kind === "table") {
@@ -677,6 +718,9 @@ const DatabaseSessionPanel: React.FC<DatabaseSessionPanelProps> = ({
             hasMore={options?.pagination?.hasMore}
             isPageLoading={options?.isPageLoading}
             onPageChange={options?.onPageChange}
+            sortColumn={options?.sortColumn}
+            sortDirection={options?.sortDirection}
+            onSortChange={options?.onSortChange}
             onCopy={createCopyHandler(result)}
             onExport={() => handleExportResult(result)}
           />
@@ -823,6 +867,9 @@ const DatabaseSessionPanel: React.FC<DatabaseSessionPanelProps> = ({
                             pagination: previewPagination,
                             onPageChange: handleChangePreviewPage,
                             isPageLoading: isLoadingPreview,
+                            sortColumn: previewSort?.column ?? null,
+                            sortDirection: previewSort?.dir ?? null,
+                            onSortChange: handleSortChange,
                           }
                         : undefined,
                     )

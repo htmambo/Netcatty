@@ -1365,12 +1365,14 @@ const api = {
       ipcRenderer.invoke("netcatty:db:getSchema", { sessionId, database }),
     getObjectDetails: (sessionId, selection) =>
       ipcRenderer.invoke("netcatty:db:getObjectDetails", { sessionId, selection }),
-    queryTableData: (sessionId, selection, page, pageSize) =>
+    queryTableData: (sessionId, selection, page, pageSize, sort) =>
       ipcRenderer.invoke("netcatty:db:queryTableData", {
         sessionId,
         selection,
         page,
         pageSize,
+        sortColumn: sort?.column,
+        sortDirection: sort?.direction,
       }),
     listObjects: (sessionId, type) => ipcRenderer.invoke("netcatty:db:listObjects", { sessionId, type }),
 

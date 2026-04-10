@@ -30,6 +30,9 @@ interface DatabaseResultsTableProps {
   hasMore?: boolean;
   isPageLoading?: boolean;
   onPageChange?: (page: number) => void;
+  sortColumn?: string | null;
+  sortDirection?: "asc" | "desc" | null;
+  onSortChange?: (column: string) => void;
   onCopy: (row: number, col: string) => void;
   onExport: () => void;
 }
@@ -87,16 +90,19 @@ const DatabaseResultsTable: React.FC<DatabaseResultsTableProps> = ({
   hasMore,
   isPageLoading,
   onPageChange,
+  sortColumn: propSortColumn,
+  sortDirection: propSortDirection,
+  onSortChange,
   onCopy,
   onExport,
 }) => {
   const { t } = useI18n();
-  const [sortColumn, setSortColumn] = useState<string | null>(null);
-  const [sortDirection, setSortDirection] = useState<SortDirection>(null);
   const [selectedRow, setSelectedRow] = useState<number | null>(null);
   const [scrollTop, setScrollTop] = useState(0);
   const [viewportHeight, setViewportHeight] = useState(0);
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
+  const sortColumn = propSortColumn ?? null;
+  const sortDirection = propSortDirection ?? null;
   const resolvedPage = typeof page === "number" && page > 0 ? page : 1;
   const resolvedPageSize = typeof pageSize === "number" && pageSize > 0 ? pageSize : rows.length || 1;
   const rowOffset = (resolvedPage - 1) * resolvedPageSize;
@@ -121,53 +127,16 @@ const DatabaseResultsTable: React.FC<DatabaseResultsTableProps> = ({
     [rows],
   );
 
-  const sortedRows = useMemo(() => {
-    if (!sortColumn || !sortDirection) return indexedRows;
-
-    return [...indexedRows].sort((a, b) => {
-      const aVal = a.row[sortColumn];
-      const bVal = b.row[sortColumn];
-
-      if (aVal === null && bVal === null) return 0;
-      if (aVal === null) return sortDirection === "asc" ? 1 : -1;
-      if (bVal === null) return sortDirection === "asc" ? -1 : 1;
-
-      if (typeof aVal === "number" && typeof bVal === "number") {
-        return sortDirection === "asc" ? aVal - bVal : bVal - aVal;
-      }
-
-      const aStr = stringifyCellValue(aVal);
-      const bStr = stringifyCellValue(bVal);
-      return sortDirection === "asc"
-        ? aStr.localeCompare(bStr)
-        : bStr.localeCompare(aStr);
-    });
-  }, [indexedRows, sortColumn, sortDirection]);
+  const sortedRows = indexedRows;
 
   const visibleRows = truncated
     ? sortedRows.slice(0, MAX_VISIBLE_ROWS)
     : sortedRows;
 
   const handleColumnClick = useCallback((column: string) => {
-    if (sortColumn !== column) {
-      setSortColumn(column);
-      setSortDirection("asc");
-      return;
-    }
-
-    if (sortDirection === "asc") {
-      setSortDirection("desc");
-      return;
-    }
-
-    if (sortDirection === "desc") {
-      setSortColumn(null);
-      setSortDirection(null);
-      return;
-    }
-
-    setSortDirection("asc");
-  }, [sortColumn, sortDirection]);
+    if (!onSortChange) return;
+    onSortChange(column);
+  }, [onSortChange]);
 
   const preparedRows = useMemo<PreparedRow[]>(
     () =>

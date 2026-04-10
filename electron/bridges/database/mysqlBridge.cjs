@@ -17,7 +17,6 @@ const SYSTEM_DATABASES = ["information_schema", "performance_schema", "mysql", "
 const TABLE_DETAILS_CACHE_TTL_MS = 2 * 60 * 1000;
 const DEFAULT_TABLE_DATA_PAGE_SIZE = 100;
 const MAX_TABLE_DATA_PAGE_SIZE = 500;
-const PREVIEW_TEXT_LENGTH = 256;
 const GEOMETRY_TYPES = [
   "geometry",
   "point",
@@ -72,7 +71,7 @@ function buildPreviewColumnExpression(column) {
   }
 
   if (type.includes("text") || type.startsWith("json")) {
-    return `CASE WHEN ${columnRef} IS NULL THEN NULL WHEN CHAR_LENGTH(CAST(${columnRef} AS CHAR)) > ${PREVIEW_TEXT_LENGTH} THEN CONCAT(LEFT(CAST(${columnRef} AS CHAR), ${PREVIEW_TEXT_LENGTH}), '...') ELSE CAST(${columnRef} AS CHAR) END AS ${alias}`;
+    return columnRef;
   }
 
   return columnRef;
@@ -526,6 +525,8 @@ async function getObjectDetails(pool, selection, database = null) {
  * @param {object} [options] - Pagination options
  * @param {number} [options.page=1] - 1-based page number
  * @param {number} [options.pageSize=100] - Page size
+ * @param {string} [options.sortColumn] - Column name to sort by
+ * @param {'asc'|'desc'} [options.sortDirection] - Sort direction
  * @param {number} [options.queryTimeout] - Query timeout in ms
  * @param {string} [database] - Default database name
  * @returns {Promise<object>}
@@ -535,6 +536,7 @@ async function queryTableData(pool, selection, options = {}, database = null) {
     return buildErrorResult("No pool available");
   }
 
+  const startTime = Date.now();
   const page = normalizePositiveInteger(options.page, 1);
   const pageSize = normalizePositiveInteger(
     options.pageSize,
@@ -560,19 +562,32 @@ async function queryTableData(pool, selection, options = {}, database = null) {
     return buildErrorResult("Database object is incomplete");
   }
 
+  const sortColumn = typeof options.sortColumn === "string" ? options.sortColumn : null;
+  const sortDirection = options.sortDirection === "desc" ? "DESC" : "ASC";
+
   const columns = Array.isArray(object.columns) ? object.columns : [];
   const qualifiedName = buildQualifiedTableName(schemaName, objectName);
   const offset = (page - 1) * pageSize;
   const fetchLimit = pageSize + 1;
+
+  const orderByClause = sortColumn
+    ? (() => {
+        const matched = columns.find(
+          (col) => col.name === sortColumn,
+        );
+        if (!matched) return "";
+        return ` ORDER BY ${quoteIdentifier(matched.name)} ${sortDirection}`;
+      })()
+    : "";
+
   const selectList =
     columns.length > 0
       ? columns.map((column) => buildPreviewColumnExpression(column)).join(",\n")
       : "*";
-  const query = `SELECT\n${selectList}\nFROM ${qualifiedName}\nLIMIT ${pageSize}${offset > 0 ? ` OFFSET ${offset}` : ""};`;
-  const dataQuery = `SELECT\n${selectList}\nFROM ${qualifiedName}\nLIMIT ? OFFSET ?`;
+  const query = `SELECT\n${selectList}\nFROM ${qualifiedName}${orderByClause}\nLIMIT ${pageSize}${offset > 0 ? ` OFFSET ${offset}` : ""};`;
+  const dataQuery = `SELECT\n${selectList}\nFROM ${qualifiedName}${orderByClause}\nLIMIT ? OFFSET ?`;
 
   const totalCountMeta = await getApproximateRowCount(pool, schemaName, objectName);
-  const startTime = Date.now();
 
   try {
     const [rows, fields] = await Promise.race([

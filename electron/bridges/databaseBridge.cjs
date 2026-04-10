@@ -617,10 +617,10 @@ async function handleGetObjectDetails(event, payload) {
 
 /**
  * Query paginated data for a specific table or view.
- * POST body: { sessionId: string, selection: object, page?: number, pageSize?: number }
+ * POST body: { sessionId: string, selection: object, page?: number, pageSize?: number, sortColumn?: string, sortDirection?: string }
  */
 async function handleQueryTableData(event, payload) {
-  const { sessionId, selection, page, pageSize } = payload || {};
+  const { sessionId, selection, page, pageSize, sortColumn, sortDirection } = payload || {};
 
   if (!sessionId) {
     return { ok: false, error: "Session ID is required" };
@@ -641,7 +641,7 @@ async function handleQueryTableData(event, payload) {
     return bridge.queryTableData(
       session.clientOrPool,
       selection,
-      { page, pageSize },
+      { page, pageSize, sortColumn, sortDirection },
       session.config.database,
     );
   }

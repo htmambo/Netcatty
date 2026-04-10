@@ -657,6 +657,7 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
       selection: DatabaseObjectSelection,
       page: number,
       pageSize: number,
+      sort?: { column: string; direction: "asc" | "desc" } | null,
     ) => {
       try {
         const { netcattyBridge: bridgeModule } = await import("../infrastructure/services/netcattyBridge");
@@ -664,7 +665,7 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
         if (!bridge?.db?.queryTableData) {
           return { ok: false, error: "Paginated database preview is unavailable" };
         }
-        return await bridge.db.queryTableData(sessionId, selection, page, pageSize);
+        return await bridge.db.queryTableData(sessionId, selection, page, pageSize, sort);
       } catch (err) {
         console.error(`Failed to query paginated table data for session ${sessionId}:`, err);
         return { ok: false, error: String(err) };
@@ -3903,8 +3904,8 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
               onDisconnect={() => handleDatabaseDisconnect(sessionId)}
               onExecuteQuery={handleExecuteQuery}
               onLoadObjectDetails={(selection) => loadDatabaseObjectDetails(sessionId, selection)}
-              onQueryTableData={(selection, page, pageSize) =>
-                queryDatabaseTableData(sessionId, selection, page, pageSize)
+              onQueryTableData={(selection, page, pageSize, sort) =>
+                queryDatabaseTableData(sessionId, selection, page, pageSize, sort)
               }
               onLoadSchemaDatabase={(databaseName) => loadDatabaseSchema(sessionId, databaseName)}
               onRefreshSchema={handleRefreshSchema}

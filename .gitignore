@@ -52,6 +52,7 @@ coverage
 # Test suite (local only, not committed)
 /tests/
 /vitest.config.ts
+/docs/
 
 # Serena MCP project config (local only)
 /.serena/
