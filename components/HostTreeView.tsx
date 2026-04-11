@@ -35,6 +35,7 @@ interface HostTreeViewProps {
   onEditDatabase?: (config: DatabaseConfig) => void;
   onDeleteDatabase?: (config: DatabaseConfig) => void;
   moveHostToGroup: (hostId: string, groupPath: string | null) => void;
+  moveDatabaseToGroup: (databaseId: string, groupPath: string | null) => void;
   moveGroup: (sourcePath: string, targetPath: string) => void;
   managedGroupPaths?: Set<string>;
   onUnmanageGroup?: (groupPath: string) => void;
@@ -66,6 +67,7 @@ interface TreeNodeProps {
   onEditDatabase?: (config: DatabaseConfig) => void;
   onDeleteDatabase?: (config: DatabaseConfig) => void;
   moveHostToGroup: (hostId: string, groupPath: string | null) => void;
+  moveDatabaseToGroup: (databaseId: string, groupPath: string | null) => void;
   moveGroup: (sourcePath: string, targetPath: string) => void;
   managedGroupPaths?: Set<string>;
   onUnmanageGroup?: (groupPath: string) => void;
@@ -98,6 +100,7 @@ const TreeNode: React.FC<TreeNodeProps> = ({
   onEditDatabase,
   onDeleteDatabase,
   moveHostToGroup,
+  moveDatabaseToGroup,
   moveGroup,
   managedGroupPaths,
   onUnmanageGroup,
@@ -200,8 +203,10 @@ const TreeNode: React.FC<TreeNodeProps> = ({
                   setDragOverDropTarget?.(null);
                   const hostId = e.dataTransfer.getData("host-id");
                   const groupPath = e.dataTransfer.getData("group-path");
+                  const databaseId = e.dataTransfer.getData("database-id");
                   if (hostId) moveHostToGroup(hostId, node.path);
                   if (groupPath) moveGroup(groupPath, node.path);
+                  if (databaseId) moveDatabaseToGroup(databaseId, node.path);
                 }}
               >
                 <div className="mr-2 flex-shrink-0 w-4 h-4 flex items-center justify-center">
@@ -291,6 +296,7 @@ const TreeNode: React.FC<TreeNodeProps> = ({
               onEditDatabase={onEditDatabase}
               onDeleteDatabase={onDeleteDatabase}
               moveHostToGroup={moveHostToGroup}
+              moveDatabaseToGroup={moveDatabaseToGroup}
               moveGroup={moveGroup}
               managedGroupPaths={managedGroupPaths}
               onUnmanageGroup={onUnmanageGroup}
@@ -329,6 +335,7 @@ const TreeNode: React.FC<TreeNodeProps> = ({
               onOpenDatabase={onOpenDatabase}
               onEditDatabase={onEditDatabase}
               onDeleteDatabase={onDeleteDatabase}
+              moveDatabaseToGroup={moveDatabaseToGroup}
             />
           ))}
         </CollapsibleContent>
@@ -343,6 +350,7 @@ interface DatabaseTreeItemProps {
   onOpenDatabase?: (config: DatabaseConfig) => void;
   onEditDatabase?: (config: DatabaseConfig) => void;
   onDeleteDatabase?: (config: DatabaseConfig) => void;
+  moveDatabaseToGroup?: (databaseId: string, groupPath: string | null) => void;
 }
 
 const DatabaseTreeItem: React.FC<DatabaseTreeItemProps> = ({
@@ -351,6 +359,7 @@ const DatabaseTreeItem: React.FC<DatabaseTreeItemProps> = ({
   onOpenDatabase,
   onEditDatabase,
   onDeleteDatabase,
+  moveDatabaseToGroup,
 }) => {
   const { t } = useI18n();
   const paddingLeft = `${depth * 20 + 12}px`;
@@ -365,6 +374,8 @@ const DatabaseTreeItem: React.FC<DatabaseTreeItemProps> = ({
           className="flex items-center py-2 pr-3 text-sm cursor-pointer transition-colors select-none group hover:bg-secondary/40 rounded-lg"
           style={{ paddingLeft }}
           onClick={() => onOpenDatabase?.(config)}
+          draggable={!!moveDatabaseToGroup}
+          onDragStart={(e) => e.dataTransfer.setData("database-id", config.id)}
         >
           <div className="mr-2 flex-shrink-0 w-4 h-4" />
           <div className="mr-3 flex-shrink-0 h-7 w-7 rounded-lg bg-[#44779F]/12 text-[#44779F] flex items-center justify-center">
@@ -748,6 +759,7 @@ export const HostTreeView: React.FC<HostTreeViewProps> = ({
           onOpenDatabase={onOpenDatabase}
           onEditDatabase={onEditDatabase}
           onDeleteDatabase={onDeleteDatabase}
+          moveDatabaseToGroup={moveDatabaseToGroup}
         />
       ))}
       

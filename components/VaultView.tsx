@@ -658,6 +658,7 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
       page: number,
       pageSize: number,
       sort?: { column: string; direction: "asc" | "desc" } | null,
+      whereClause?: string | null,
     ) => {
       try {
         const { netcattyBridge: bridgeModule } = await import("../infrastructure/services/netcattyBridge");
@@ -665,7 +666,7 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
         if (!bridge?.db?.queryTableData) {
           return { ok: false, error: "Paginated database preview is unavailable" };
         }
-        return await bridge.db.queryTableData(sessionId, selection, page, pageSize, sort);
+        return await bridge.db.queryTableData(sessionId, selection, page, pageSize, sort, whereClause);
       } catch (err) {
         console.error(`Failed to query paginated table data for session ${sessionId}:`, err);
         return { ok: false, error: String(err) };
@@ -2438,6 +2439,34 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
     setDragOverDropTarget(path ? { kind: "group", path } : null);
   }, []);
 
+  const moveDatabaseToGroup = useCallback((databaseId: string, groupPath: string | null) => {
+    const targetGroup = groupPath || "";
+    const dbToMove = databaseConfigs.find((d) => d.id === databaseId);
+    if (!dbToMove || (dbToMove.group || "") === targetGroup) {
+      setDragOverDropTarget(null);
+      return;
+    }
+
+    const updatedDatabaseConfigs = databaseConfigs.map((d) => {
+      if (d.id !== databaseId) return d;
+      return { ...d, group: targetGroup };
+    });
+
+    const changedConfigs = updatedDatabaseConfigs.filter((d, i) => d !== databaseConfigs[i]);
+    if (changedConfigs.length === 0) return;
+
+    setDatabaseConfigs(updatedDatabaseConfigs);
+    void persistDatabaseConfigUpdates(changedConfigs);
+    setDragOverDropTarget(null);
+    pulseDropTarget(groupPath ? { kind: "group", path: groupPath } : { kind: "root" });
+    toast.success(
+      t("vault.hosts.moveToGroup.success", {
+        host: dbToMove.label,
+        group: groupPath || t("vault.hosts.allHosts"),
+      }),
+    );
+  }, [databaseConfigs, persistDatabaseConfigUpdates, pulseDropTarget, t]);
+
   const moveHostToGroup = useCallback((hostId: string, groupPath: string | null) => {
     const targetGroup = groupPath || "";
     const hostToMove = hosts.find((h) => h.id === hostId);
@@ -2946,8 +2975,10 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
                           setDragOverDropTarget(null);
                           const groupPath = e.dataTransfer.getData("group-path");
                           const hostId = e.dataTransfer.getData("host-id");
+                          const databaseId = e.dataTransfer.getData("database-id");
                           if (groupPath) moveGroup(groupPath, null);
                           if (hostId) moveHostToGroup(hostId, null);
+                          if (databaseId) moveDatabaseToGroup(databaseId, null);
                         }}
                       >
                         {t("vault.hosts.allHosts")}
@@ -3215,7 +3246,9 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
                         e.stopPropagation();
                         const hostId = e.dataTransfer.getData("host-id");
                         const groupPath = e.dataTransfer.getData("group-path");
+                        const databaseId = e.dataTransfer.getData("database-id");
                         if (hostId) moveHostToGroup(hostId, selectedGroupPath);
+                        if (databaseId) moveDatabaseToGroup(databaseId, selectedGroupPath);
                         if (groupPath && selectedGroupPath !== null)
                           moveGroup(groupPath, selectedGroupPath);
                       }}
@@ -3261,7 +3294,10 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
                                   e.dataTransfer.getData("host-id");
                                 const groupPath =
                                   e.dataTransfer.getData("group-path");
+                                const databaseId =
+                                  e.dataTransfer.getData("database-id");
                                 if (hostId) moveHostToGroup(hostId, node.path);
+                                if (databaseId) moveDatabaseToGroup(databaseId, node.path);
                                 if (groupPath) moveGroup(groupPath, node.path);
                               }}
                             >
@@ -3426,6 +3462,7 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
                       onEditDatabase={handleDatabaseEditConfig}
                       onDeleteDatabase={(config) => void handleDatabaseDeleteConfig(config.id)}
                       moveHostToGroup={moveHostToGroup}
+                      moveDatabaseToGroup={moveDatabaseToGroup}
                       moveGroup={moveGroup}
                       managedGroupPaths={managedGroupPaths}
                       onUnmanageGroup={handleUnmanageGroup}
@@ -3904,8 +3941,8 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
               onDisconnect={() => handleDatabaseDisconnect(sessionId)}
               onExecuteQuery={handleExecuteQuery}
               onLoadObjectDetails={(selection) => loadDatabaseObjectDetails(sessionId, selection)}
-              onQueryTableData={(selection, page, pageSize, sort) =>
-                queryDatabaseTableData(sessionId, selection, page, pageSize, sort)
+              onQueryTableData={(selection, page, pageSize, sort, whereClause) =>
+                queryDatabaseTableData(sessionId, selection, page, pageSize, sort, whereClause)
               }
               onLoadSchemaDatabase={(databaseName) => loadDatabaseSchema(sessionId, databaseName)}
               onRefreshSchema={handleRefreshSchema}
