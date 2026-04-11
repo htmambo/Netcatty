@@ -502,7 +502,7 @@ declare global {
       execute(sessionId: string, queryOrCommand: string | string[], params?: unknown[]): Promise<unknown>;
       getSchema(sessionId: string, database?: string): Promise<unknown>;
       getObjectDetails(sessionId: string, selection: unknown): Promise<unknown>;
-      queryTableData(sessionId: string, selection: unknown, page?: number, pageSize?: number): Promise<unknown>;
+      queryTableData(sessionId: string, selection: unknown, page?: number, pageSize?: number, sort?: unknown, whereClause?: string | null): Promise<unknown>;
       listObjects(sessionId: string, type?: string): Promise<unknown>;
       onStatusChange(cb: (payload: unknown) => void): () => void;
       onError(cb: (payload: unknown) => void): () => void;
