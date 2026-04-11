@@ -15,8 +15,8 @@ const {
 
 const SYSTEM_DATABASES = ["information_schema", "performance_schema", "mysql", "sys"];
 const TABLE_DETAILS_CACHE_TTL_MS = 2 * 60 * 1000;
-const DEFAULT_TABLE_DATA_PAGE_SIZE = 100;
-const MAX_TABLE_DATA_PAGE_SIZE = 500;
+const DEFAULT_TABLE_DATA_PAGE_SIZE = 500;
+const MAX_TABLE_DATA_PAGE_SIZE = 1000;
 const GEOMETRY_TYPES = [
   "geometry",
   "point",
@@ -564,6 +564,9 @@ async function queryTableData(pool, selection, options = {}, database = null) {
 
   const sortColumn = typeof options.sortColumn === "string" ? options.sortColumn : null;
   const sortDirection = options.sortDirection === "desc" ? "DESC" : "ASC";
+  const whereClause = typeof options.whereClause === "string" && options.whereClause.trim()
+    ? ` WHERE ${options.whereClause.trim()}`
+    : "";
 
   const columns = Array.isArray(object.columns) ? object.columns : [];
   const qualifiedName = buildQualifiedTableName(schemaName, objectName);
@@ -584,8 +587,8 @@ async function queryTableData(pool, selection, options = {}, database = null) {
     columns.length > 0
       ? columns.map((column) => buildPreviewColumnExpression(column)).join(",\n")
       : "*";
-  const query = `SELECT\n${selectList}\nFROM ${qualifiedName}${orderByClause}\nLIMIT ${pageSize}${offset > 0 ? ` OFFSET ${offset}` : ""};`;
-  const dataQuery = `SELECT\n${selectList}\nFROM ${qualifiedName}${orderByClause}\nLIMIT ? OFFSET ?`;
+  const query = `SELECT\n${selectList}\nFROM ${qualifiedName}${whereClause}${orderByClause}\nLIMIT ${pageSize}${offset > 0 ? ` OFFSET ${offset}` : ""};`;
+  const dataQuery = `SELECT\n${selectList}\nFROM ${qualifiedName}${whereClause}${orderByClause}\nLIMIT ? OFFSET ?`;
 
   const totalCountMeta = await getApproximateRowCount(pool, schemaName, objectName);
 
