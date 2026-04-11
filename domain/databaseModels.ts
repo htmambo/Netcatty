@@ -162,3 +162,38 @@ export interface QueryTab {
   isExecuting: boolean;
   error?: string;
 }
+
+// Filter types
+export type FilterOperator = '=' | '!=' | '<' | '>' | '<=' | '>=' | 'LIKE' | 'NOT LIKE' | 'IN' | 'NOT IN' | 'IS NULL' | 'IS NOT NULL' | 'BETWEEN';
+
+export interface FilterCondition {
+  id: string;
+  column: string;
+  operator: FilterOperator;
+  value: string | string[] | null;
+  enabled: boolean;
+  /** Logic operator between this and the previous sibling (first child has no predecessor, so this is unused) */
+  logicOperator?: 'AND' | 'OR';
+}
+
+export interface FilterGroup {
+  id: string;
+  logicOperator: 'AND' | 'OR';
+  children: (FilterCondition | FilterGroup)[];
+}
+
+export interface FilterState {
+  rootGroup: FilterGroup;
+}
+
+// Cell editing
+export type ColumnInputType = 'text' | 'longtext' | 'number' | 'decimal' | 'date' | 'datetime' | 'boolean' | 'enum';
+
+export interface EditCellRequest {
+  rowIndex: number;
+  column: string;
+  oldValue: unknown;
+  newValue: unknown;
+  primaryKeyColumn: string;
+  primaryKeyValue: unknown;
+}

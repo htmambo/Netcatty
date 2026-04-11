@@ -1,8 +1,13 @@
 import type {
   ColumnInfo,
+  ColumnInputType,
   DatabaseConfig,
   DatabaseDriver,
   DatabaseSchema,
+  FilterCondition,
+  FilterGroup,
+  FilterOperator,
+  FilterState,
   TableInfo,
 } from "./databaseModels";
 
@@ -971,7 +976,7 @@ export const applyDatabaseObjectDetails = (
 
   const wrapper = isRecord(schemaInput) ? { ...schemaInput } : {};
   const hasWrappedSchema = isRecord(wrapper.schema);
-  const rawSchema = hasWrappedSchema ? { ...wrapper.schema } : { ...wrapper };
+  const rawSchema = hasWrappedSchema ? { ...(wrapper.schema as Record<string, unknown>) } : { ...wrapper };
   const collectionKey = selection.kind === "table" ? "tables" : "views";
   const source = Array.isArray(rawSchema[collectionKey]) ? rawSchema[collectionKey] : [];
 
@@ -1049,4 +1054,236 @@ export const mergeDatabaseSchema = (
     totalKeyCount: next.totalKeyCount ?? current.totalKeyCount,
     keyspaces: next.keyspaces || current.keyspaces,
   };
+};
+
+// --- Column input type detection ---
+
+export const detectColumnInputType = (column: ColumnInfo, _driver: DatabaseDriver): ColumnInputType => {
+  const type = column.dataType.trim().toLowerCase();
+
+  // Boolean
+  if (type === "boolean" || type === "bool" || type === "bit(1)") {
+    return "boolean";
+  }
+
+  // Date/time
+  if (type === "date") return "date";
+  if (type === "datetime" || type === "timestamp" || type === "datetime2" || type === "smalldatetime") {
+    return "datetime";
+  }
+
+  // Numeric
+  if (
+    type === "int" ||
+    type === "bigint" ||
+    type === "tinyint" ||
+    type === "smallint" ||
+    type === "mediumint" ||
+    type === "integer" ||
+    type === "int4" ||
+    type === "int8" ||
+    type === "bigserial" ||
+    type === "serial"
+  ) {
+    return "number";
+  }
+
+  if (
+    type === "decimal" ||
+    type === "numeric" ||
+    type === "float" ||
+    type === "double" ||
+    type === "real" ||
+    type === "float4" ||
+    type === "float8" ||
+    type === "money" ||
+    type === "smallmoney"
+  ) {
+    return "decimal";
+  }
+
+  // Enum
+  const enumMatch = type.match(/^enum\s*\(/i);
+  if (enumMatch || type.startsWith("enum")) {
+    return "enum";
+  }
+
+  // Long text (TEXT, MEDIUMTEXT, LONGTEXT) → opens textarea modal
+  const baseType = type.replace(/\(.*/, "").trim();
+  if (
+    baseType === "text" ||
+    baseType === "mediumtext" ||
+    baseType === "longtext" ||
+    baseType === "tinytext"
+  ) {
+    return "longtext";
+  }
+
+  // Short text (VARCHAR, CHAR, etc.) → inline input
+  return "text";
+};
+
+// --- SQL value formatting ---
+
+const formatSqlValue = (value: unknown, inputType: ColumnInputType, driver: DatabaseDriver): string => {
+  if (value === null || value === undefined) return "NULL";
+
+  switch (inputType) {
+    case "boolean":
+      if (typeof value === "boolean") return value ? "1" : "0";
+      if (typeof value === "string") {
+        const lower = value.toLowerCase();
+        if (lower === "1" || lower === "true" || lower === "yes" || lower === "on") return "1";
+        return "0";
+      }
+      return Number(value) ? "1" : "0";
+
+    case "number":
+      return String(Number(value));
+
+    case "decimal":
+      return String(Number(value));
+
+    case "date":
+    case "datetime":
+      if (typeof value === "string") return `'${value.replace(/'/g, "''")}'`;
+      return `'${String(value).replace(/'/g, "''")}'`;
+
+    default:
+      if (typeof value === "string") return `'${value.replace(/'/g, "''")}'`;
+      if (typeof value === "object") return `'${JSON.stringify(value).replace(/'/g, "''")}'`;
+      return `'${String(value).replace(/'/g, "''")}'`;
+  }
+};
+
+// --- WHERE clause builder ---
+
+const quoteValueForWhere = (value: unknown, operator: FilterOperator): string => {
+  if (operator === "IS NULL" || operator === "IS NOT NULL") return "";
+
+  if (operator === "IN" || operator === "NOT IN") {
+    if (Array.isArray(value)) {
+      const formatted = value.map((v) => {
+        if (v === null) return "NULL";
+        if (typeof v === "number") return String(v);
+        return `'${String(v).replace(/'/g, "''")}'`;
+      });
+      return `(${formatted.join(", ")})`;
+    }
+    return "(NULL)";
+  }
+
+  if (operator === "BETWEEN") {
+    if (Array.isArray(value) && value.length >= 2) {
+      const left = typeof value[0] === "number" ? String(value[0]) : `'${String(value[0]).replace(/'/g, "''")}'`;
+      const right = typeof value[1] === "number" ? String(value[1]) : `'${String(value[1]).replace(/'/g, "''")}'`;
+      return `${left} AND ${right}`;
+    }
+    return "NULL AND NULL";
+  }
+
+  if (operator === "LIKE" || operator === "NOT LIKE") {
+    return `'${String(value ?? "").replace(/'/g, "''")}'`;
+  }
+
+  if (typeof value === "number") return String(value);
+  return `'${String(value ?? "").replace(/'/g, "''")}'`;
+};
+
+const buildGroupClause = (group: FilterGroup): string | null => {
+  const allChildren = group.children;
+
+  const parts: string[] = [];
+  for (let i = 0; i < allChildren.length; i++) {
+    const child = allChildren[i];
+
+    // Check if child is enabled
+    const isCondition = "column" in child;
+    if (isCondition) {
+      const cond = child as FilterCondition;
+      if (!cond.enabled || !cond.column) continue;
+    } else {
+      const sub = buildGroupClause(child as FilterGroup);
+      if (!sub) continue;
+      parts.push(`(${sub})`);
+      continue;
+    }
+
+    // Build condition string
+    const cond = child as FilterCondition;
+    const colRef = cond.column;
+    const op = cond.operator;
+    const condStr = op === "IS NULL" || op === "IS NOT NULL"
+      ? `${colRef} ${op}`
+      : `${colRef} ${op} ${quoteValueForWhere(cond.value, op)}`;
+
+    // Use child's logicOperator (AND/OR with previous), or default to group's
+    const logicOp = cond.logicOperator ?? group.logicOperator;
+    if (parts.length > 0) {
+      parts.push(` ${logicOp} `);
+    }
+    parts.push(condStr);
+  }
+
+  return parts.length === 0 ? null : parts.join("");
+};
+
+export const buildWhereClause = (filter: FilterState, _driver: DatabaseDriver): string | null => {
+  return buildGroupClause(filter.rootGroup);
+};
+
+// --- UPDATE statement builder ---
+
+export const buildUpdateStatement = (
+  tableName: string,
+  schemaName: string | undefined,
+  pkColumn: string,
+  pkValue: unknown,
+  updates: Record<string, unknown>,
+  driver: DatabaseDriver,
+): string => {
+  const objectName = schemaName
+    ? `${quoteSqlIdentifier(driver, schemaName)}.${quoteSqlIdentifier(driver, tableName)}`
+    : quoteSqlIdentifier(driver, tableName);
+
+  const setParts = Object.entries(updates).map(([col, val]) => {
+    if (val === null) return `${quoteSqlIdentifier(driver, col)} = NULL`;
+    if (typeof val === "number") return `${quoteSqlIdentifier(driver, col)} = ${String(val)}`;
+    return `${quoteSqlIdentifier(driver, col)} = '${String(val).replace(/'/g, "''")}'`;
+  });
+
+  const pkValStr =
+    typeof pkValue === "number" ? String(pkValue) : `'${String(pkValue).replace(/'/g, "''")}'`;
+
+  return `UPDATE ${objectName} SET ${setParts.join(", ")} WHERE ${quoteSqlIdentifier(driver, pkColumn)} = ${pkValStr} LIMIT 1;`;
+};
+
+// --- Preview query with WHERE filter ---
+
+export const buildFilteredPreviewQuery = (
+  selection: DatabaseObjectSelection | null,
+  schemaInput: unknown,
+  driver: DatabaseDriver,
+  filter: FilterState,
+  options?: DatabasePreviewQueryOptions,
+): { title: string; query: string } | null => {
+  const base = buildPreviewQueryTemplateForSelection(selection, schemaInput, driver, options);
+  if (!base) return null;
+
+  const whereClause = buildWhereClause(filter, driver);
+  if (!whereClause) return base;
+
+  // Insert WHERE before LIMIT
+  const limitMatch = base.query.match(/\bLIMIT\s+\d+/i);
+  if (limitMatch) {
+    const query = base.query.replace(
+      /\bLIMIT\s+\d+(\s+OFFSET\s+\d+)?/i,
+      `WHERE ${whereClause} $&`,
+    );
+    return { title: base.title, query };
+  }
+
+  // No LIMIT found, append WHERE before trailing semicolon
+  const query = base.query.replace(/;?\s*$/, ` WHERE ${whereClause};`);
+  return { title: base.title, query };
 };
