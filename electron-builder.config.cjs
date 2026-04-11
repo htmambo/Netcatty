@@ -21,6 +21,7 @@ module.exports = {
         'electron/**/*',
         'lib/**/*.cjs',
         '!electron/.dev-config.json',
+        'skills/**/*',
         'public/**/*',
         'node_modules/**/*'
     ],
@@ -42,7 +43,10 @@ module.exports = {
         'node_modules/fast-deep-equal/**/*',
         'node_modules/fast-uri/**/*',
         'node_modules/json-schema-traverse/**/*',
+        'electron/cli/**/*',
         'electron/mcp/**/*'
+        ,
+        'skills/**/*'
     ],
     mac: {
         target: [
@@ -84,8 +88,15 @@ module.exports = {
             {
                 target: 'nsis',
                 arch: ['x64', 'arm64']
+            },
+            {
+                target: 'portable',
+                arch: ['x64', 'arm64']
             }
         ]
+    },
+    portable: {
+        artifactName: '${productName}-${version}-portable-${os}-${arch}.${ext}',
     },
     nsis: {
         oneClick: false,

@@ -22,6 +22,7 @@ const dragRegionNoSelect = { WebkitAppRegion: 'drag', userSelect: 'none' } as Re
 
 interface TopTabsProps {
   theme: 'dark' | 'light';
+  followAppTerminalTheme?: boolean;
   hosts: Host[];
   sessions: TerminalSession[];
   orphanSessions: TerminalSession[];
@@ -247,6 +248,7 @@ WindowControls.displayName = 'WindowControls';
 
 const TopTabsInner: React.FC<TopTabsProps> = ({
   theme,
+  followAppTerminalTheme = false,
   hosts,
   sessions,
   orphanSessions,
@@ -1026,7 +1028,7 @@ const TopTabsInner: React.FC<TopTabsProps> = ({
             className="h-6 w-6 app-no-drag"
             style={{ color: 'var(--top-tabs-muted, hsl(var(--muted-foreground)))' }}
             onClick={onToggleTheme}
-            disabled={isImmersiveActive}
+            disabled={isImmersiveActive && !followAppTerminalTheme}
             title="Toggle theme"
           >
             {theme === 'dark' ? <Sun size={16} /> : <Moon size={16} />}
@@ -1056,7 +1058,9 @@ const topTabsAreEqual = (prev: TopTabsProps, next: TopTabsProps): boolean => {
     prev.onOpenSettings === next.onOpenSettings &&
     prev.onSyncNow === next.onSyncNow &&
     prev.isImmersiveActive === next.isImmersiveActive &&
-    prev.databaseSessions === next.databaseSessions
+    prev.databaseSessions === next.databaseSessions &&
+    prev.onToggleTheme === next.onToggleTheme &&
+    prev.followAppTerminalTheme === next.followAppTerminalTheme
   );
 };
 
