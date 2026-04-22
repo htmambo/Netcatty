@@ -30,6 +30,7 @@ module.exports = {
         'node_modules/better-sqlite3/**/*',
         'node_modules/ssh2/**/*',
         'node_modules/cpu-features/**/*',
+        'node_modules/@vscode/windows-process-tree/**/*',
         'node_modules/@zed-industries/claude-agent-acp/**/*',
         'node_modules/@agentclientprotocol/sdk/**/*',
         'node_modules/@anthropic-ai/claude-agent-sdk/**/*',

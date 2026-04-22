@@ -399,9 +399,10 @@ export const DEFAULT_KEY_BINDINGS: KeyBinding[] = [
   // Terminal Operations
   { id: 'copy', action: 'copy', label: 'Copy from Terminal', mac: '⌘ + C', pc: 'Ctrl + Shift + C', category: 'terminal' },
   { id: 'paste', action: 'paste', label: 'Paste to Terminal', mac: '⌘ + V', pc: 'Ctrl + Shift + V', category: 'terminal' },
+  { id: 'paste-selection', action: 'pasteSelection', label: 'Paste Selection to Terminal', mac: '⌘ + Shift + X', pc: 'Ctrl + Shift + X', category: 'terminal' },
   { id: 'select-all', action: 'selectAll', label: 'Select All in Terminal', mac: '⌘ + A', pc: 'Ctrl + Shift + A', category: 'terminal' },
   { id: 'clear-buffer', action: 'clearBuffer', label: 'Clear Terminal Buffer', mac: '⌘ + ⌃ + K', pc: 'Ctrl + Shift + K', category: 'terminal' },
-  { id: 'search-terminal', action: 'searchTerminal', label: 'Open Terminal Search', mac: '⌘ + F', pc: 'Ctrl + Shift + F', category: 'terminal' },
+  { id: 'search-terminal', action: 'searchTerminal', label: 'Open Terminal Search', mac: '⌘ + F', pc: 'Ctrl + F', category: 'terminal' },
 
   // Navigation / Split View
   { id: 'move-focus', action: 'moveFocus', label: 'Move focus between Split View panes', mac: '⌘ + ⌥ + arrows', pc: 'Ctrl + Alt + arrows', category: 'navigation' },
@@ -415,6 +416,7 @@ export const DEFAULT_KEY_BINDINGS: KeyBinding[] = [
   { id: 'port-forwarding', action: 'portForwarding', label: 'Open Port Forwarding', mac: '⌘ + P', pc: 'Ctrl + P', category: 'app' },
   { id: 'command-palette', action: 'commandPalette', label: 'Open Command Palette', mac: '⌘ + K', pc: 'Ctrl + K', category: 'app' },
   { id: 'quick-switch', action: 'quickSwitch', label: 'Quick Switch', mac: '⌘ + J', pc: 'Ctrl + J', category: 'app' },
+  { id: 'new-workspace', action: 'newWorkspace', label: 'New Workspace', mac: '⌘ + Shift + J', pc: 'Ctrl + Shift + J', category: 'app' },
   { id: 'snippets', action: 'snippets', label: 'Open Snippets', mac: '⌘ + Shift + S', pc: 'Ctrl + Shift + S', category: 'app' },
   { id: 'broadcast', action: 'broadcast', label: 'Switch the Broadcast Mode', mac: '⌘ + B', pc: 'Ctrl + B', category: 'app' },
 
@@ -500,6 +502,18 @@ export interface TerminalSettings {
 
   // Paste
   disableBracketedPaste: boolean; // Disable bracketed paste mode (avoid ^[[200~ artifacts)
+
+  // Shell `clear` command behavior — controls whether CSI 3 J (erase scrollback)
+  // from the shell is honored. Default true matches POSIX/ncurses since 2013:
+  // `clear` clears both visible screen and scrollback. Disable to keep history
+  // across `clear` (matches iTerm2 default and pre-2013 behavior).
+  clearWipesScrollback: boolean;
+
+  // When true, typing on the keyboard does NOT clear an existing mouse
+  // selection. Lets the user select text, type a command prefix (e.g. `sz `),
+  // and then paste the still-live selection. xterm.js's default is to clear
+  // on input; this opt-in toggle restores the selection right after.
+  preserveSelectionOnInput: boolean;
 
   // Clipboard
   osc52Clipboard: 'off' | 'write-only' | 'read-write' | 'prompt'; // OSC-52 clipboard access: off, write-only (default), read-write, or prompt on read
@@ -629,6 +643,8 @@ const DEFAULT_TERMINAL_SETTINGS: TerminalSettings = {
   showServerStats: true, // Show server stats by default
   serverStatsRefreshInterval: 5, // Refresh every 5 seconds
   disableBracketedPaste: false, // Bracketed paste enabled by default
+  clearWipesScrollback: true, // POSIX-standard: shell `clear` clears scrollback too
+  preserveSelectionOnInput: false, // Opt-in: keep selection alive when typing
   osc52Clipboard: 'write-only', // OSC-52: allow remote programs to write clipboard by default
   rendererType: 'auto', // Auto-detect best renderer based on hardware
   autocompleteEnabled: true, // Autocomplete enabled by default

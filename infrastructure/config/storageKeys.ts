@@ -40,6 +40,33 @@ export const STORAGE_KEY_UPDATE_LAST_CHECK = 'netcatty_update_last_check_v1';
 export const STORAGE_KEY_UPDATE_DISMISSED_VERSION = 'netcatty_update_dismissed_version_v1';
 export const STORAGE_KEY_UPDATE_LATEST_RELEASE = 'netcatty_update_latest_release_v1';
 export const STORAGE_KEY_AUTO_UPDATE_ENABLED = 'netcatty_auto_update_enabled_v1';
+export const STORAGE_KEY_LOCAL_VAULT_BACKUP_MAX_COUNT = 'netcatty_local_vault_backup_max_count_v1';
+export const STORAGE_KEY_LOCAL_VAULT_BACKUP_LAST_APP_VERSION = 'netcatty_local_vault_backup_last_app_version_v1';
+
+/**
+ * Cross-window barrier: set while a local vault restore is applying so
+ * auto-sync in another window doesn't upload a pre-restore snapshot
+ * concurrently. The value is an epoch-ms deadline — auto-sync treats any
+ * value in the future as "restore in progress" and any value in the past
+ * as a stale lock that can be ignored. See useAutoSync and
+ * CloudSyncSettings for readers/writers.
+ */
+export const STORAGE_KEY_VAULT_RESTORE_IN_PROGRESS_UNTIL = 'netcatty_vault_restore_in_progress_until_v1';
+
+/**
+ * Apply-in-progress sentinel. Set before a destructive applySyncPayload
+ * starts writing and cleared after it completes successfully. If this
+ * value is present on a later startup, the previous apply was
+ * interrupted mid-way (renderer crash, power loss, IPC failure) and the
+ * local vault is a partial mix of pre-apply and post-apply state.
+ * Auto-sync must refuse to push in that window — otherwise the partial
+ * state would silently overwrite an intact cloud copy — until the user
+ * manually restores from a protective backup or completes a full merge.
+ * The value is a JSON-encoded record (startedAt, protectiveBackupId,
+ * source) so the UI can surface a specific recovery hint rather than a
+ * generic "something broke" warning.
+ */
+export const STORAGE_KEY_VAULT_APPLY_IN_PROGRESS = 'netcatty_vault_apply_in_progress_v1';
 
 // SFTP File Opener Associations
 export const STORAGE_KEY_SFTP_FILE_ASSOCIATIONS = 'netcatty_sftp_file_associations_v1';
@@ -112,12 +139,17 @@ export const STORAGE_KEY_IMMERSIVE_MODE = 'netcatty_immersive_mode_v1';
 
 // Vault: Show Recently Connected hosts section
 export const STORAGE_KEY_SHOW_RECENT_HOSTS = 'netcatty_show_recent_hosts_v1';
+export const STORAGE_KEY_SHOW_ONLY_UNGROUPED_HOSTS_IN_ROOT = 'netcatty_show_only_ungrouped_hosts_in_root_v1';
+
+// Top tabs: Show standalone SFTP view tab
+export const STORAGE_KEY_SHOW_SFTP_TAB = 'netcatty_show_sftp_tab_v1';
 
 // Group Configurations (default settings inherited by hosts)
 export const STORAGE_KEY_GROUP_CONFIGS = 'netcatty_group_configs_v1';
 
 // Side Panel
 export const STORAGE_KEY_SIDE_PANEL_WIDTH = 'netcatty_side_panel_width';
+export const STORAGE_KEY_WORKSPACE_FOCUS_SIDEBAR_WIDTH = 'netcatty_workspace_focus_sidebar_width';
 
 // Port Forwarding (transient cross-window broadcast key)
 export const STORAGE_KEY_PF_RECONNECT_CANCEL = '__netcatty_pf_cancel_reconnect';

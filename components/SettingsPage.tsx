@@ -41,7 +41,7 @@ class AITabErrorBoundary extends React.Component<
         </div>
       );
     }
-    return this.props.children;
+    return (this.props as { children: React.ReactNode }).children;
   }
 }
 
@@ -286,6 +286,12 @@ const SettingsPageContent: React.FC<{ settings: SettingsState }> = ({ settings }
                             setUiLanguage={settings.setUiLanguage}
                             customCSS={settings.customCSS}
                             setCustomCSS={settings.setCustomCSS}
+                            showRecentHosts={settings.showRecentHosts}
+                            setShowRecentHosts={settings.setShowRecentHosts}
+                            showOnlyUngroupedHostsInRoot={settings.showOnlyUngroupedHostsInRoot}
+                            setShowOnlyUngroupedHostsInRoot={settings.setShowOnlyUngroupedHostsInRoot}
+                            showSftpTab={settings.showSftpTab}
+                            setShowSftpTab={settings.setShowSftpTab}
                         />
                     )}
 

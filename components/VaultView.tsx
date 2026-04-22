@@ -38,7 +38,7 @@ import { useStoredViewMode } from "../application/state/useStoredViewMode";
 import { useStoredBoolean } from "../application/state/useStoredBoolean";
 import { useTreeExpandedState } from "../application/state/useTreeExpandedState";
 import { resolveGroupDefaults, applyGroupDefaults } from "../domain/groupConfig";
-import { getEffectiveHostDistro, sanitizeHost } from "../domain/host";
+import { getEffectiveHostDistro, sanitizeHost, upsertHostById } from "../domain/host";
 import { importVaultHostsFromText, exportHostsToCsvWithStats } from "../domain/vaultImport";
 import type { VaultImportFormat } from "../domain/vaultImport";
 import {
@@ -47,7 +47,12 @@ import {
   tokenizeDatabaseCommand,
 } from "../domain/databaseSchemaView";
 import type { DatabaseObjectSelection } from "../domain/databaseSchemaView";
-import { STORAGE_KEY_VAULT_HOSTS_VIEW_MODE, STORAGE_KEY_VAULT_HOSTS_TREE_EXPANDED, STORAGE_KEY_VAULT_SIDEBAR_COLLAPSED, STORAGE_KEY_SHOW_RECENT_HOSTS } from "../infrastructure/config/storageKeys";
+import {
+  STORAGE_KEY_VAULT_HOSTS_VIEW_MODE,
+  STORAGE_KEY_VAULT_HOSTS_TREE_EXPANDED,
+  STORAGE_KEY_VAULT_SIDEBAR_COLLAPSED,
+  STORAGE_KEY_SHOW_RECENT_HOSTS,
+} from "../infrastructure/config/storageKeys";
 import { cn } from "../lib/utils";
 import { useInstantThemeSwitch } from "../lib/useInstantThemeSwitch";
 import {
@@ -81,6 +86,7 @@ import SerialHostDetailsPanel from "./SerialHostDetailsPanel";
 import SnippetsManager from "./SnippetsManager";
 import { ImportVaultDialog, ImportOptions } from "./vault/ImportVaultDialog";
 import { Button } from "./ui/button";
+import { RippleButton } from "./ui/ripple";
 import {
   ContextMenu,
   ContextMenuContent,
@@ -168,6 +174,8 @@ interface VaultViewProps {
   onRunSnippet?: (snippet: Snippet, targetHosts: Host[]) => void;
   groupConfigs: GroupConfig[];
   onUpdateGroupConfigs: (configs: GroupConfig[]) => void;
+  showRecentHosts: boolean;
+  showOnlyUngroupedHostsInRoot: boolean;
   onDatabaseSessionsChange?: (sessions: DatabaseSession[]) => void;
   onDatabaseConfigsChange?: (configs: DatabaseConfig[]) => void;
   // Optional: navigate to a specific section on mount or when changed
@@ -216,6 +224,8 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
   onRunSnippet,
   groupConfigs,
   onUpdateGroupConfigs,
+  showRecentHosts,
+  showOnlyUngroupedHostsInRoot,
   onDatabaseSessionsChange,
   onDatabaseConfigsChange,
   navigateToSection,
@@ -338,11 +348,6 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
   const [dragOverDropTarget, setDragOverDropTarget] = useState<DropTarget | null>(null);
   const [confirmedDropTarget, setConfirmedDropTarget] = useState<DropTarget | null>(null);
   const dropTargetPulseTimeoutRef = useRef<number | null>(null);
-
-  const [showRecentHosts, _setShowRecentHosts] = useStoredBoolean(
-    STORAGE_KEY_SHOW_RECENT_HOSTS,
-    true,
-  );
 
   // Handle external navigation requests
   useEffect(() => {
@@ -1611,18 +1616,30 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
 
   const displayedHosts = useMemo(() => {
     let filtered = hosts;
-    if (selectedGroupPath) {
-      // Match hosts whose group equals the selected path
-      // For "General" group, also match hosts with empty/undefined group
-      filtered = filtered.filter((h) => {
-        const hostGroup = h.group || "";
-        if (selectedGroupPath === "General") {
-          return hostGroup === "" || hostGroup === "General";
-        }
-        return hostGroup === selectedGroupPath;
-      });
+    // Search spans all groups (#777): when the user types in the search box
+    // we skip group/ungrouped-root scoping, so a matching host in another
+    // group is still reachable without having to navigate into it first.
+    // The tree view already uses this shape — see `treeViewHosts` below.
+    const hasSearch = search.trim().length > 0;
+    if (!hasSearch) {
+      if (selectedGroupPath) {
+        // Match hosts whose group equals the selected path
+        // For "General" group, also match hosts with empty/undefined group
+        filtered = filtered.filter((h) => {
+          const hostGroup = h.group || "";
+          if (selectedGroupPath === "General") {
+            return hostGroup === "" || hostGroup === "General";
+          }
+          return hostGroup === selectedGroupPath;
+        });
+      } else if (showOnlyUngroupedHostsInRoot) {
+        filtered = filtered.filter((h) => {
+          const hostGroup = (h.group || "").trim();
+          return hostGroup === "";
+        });
+      }
     }
-    if (search.trim()) {
+    if (hasSearch) {
       const s = search.toLowerCase();
       filtered = filtered.filter(
         (h) =>
@@ -1658,7 +1675,7 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
       }
     });
     return filtered;
-  }, [hosts, selectedGroupPath, search, selectedTags, sortMode]);
+  }, [hosts, selectedGroupPath, showOnlyUngroupedHostsInRoot, search, selectedTags, sortMode]);
 
   const displayedDatabaseConfigs = useMemo(() => {
     if (selectedTags.length > 0) return [];
@@ -1757,6 +1774,10 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
   // No longer deduplicate pinned/recent hosts from the main list,
   // so hosts always appear in their groups regardless of pinned/recent status.
   const pinnedRecentIds = useMemo(() => new Set<string>(), []);
+  const visibleDisplayedHosts = useMemo(
+    () => displayedHosts.filter((h) => selectedGroupPath || !pinnedRecentIds.has(h.id)),
+    [displayedHosts, selectedGroupPath, pinnedRecentIds],
+  );
 
   // For tree view: apply search, tag filter, and sorting, but not group filtering
   const treeViewHosts = useMemo(() => {
@@ -2019,6 +2040,26 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps -- findGroupNode is derived from buildGroupTree
   }, [buildGroupTree, selectedGroupPath, customGroups]);
+  const shouldHideEmptyRootHostsSection = useMemo(() => {
+    if (selectedGroupPath || viewMode === "tree") return false;
+    if (search.trim() || selectedTags.length > 0) return false;
+    if (visibleDisplayedHosts.length > 0) return false;
+    return (
+      displayedGroups.length > 0 ||
+      pinnedHosts.length > 0 ||
+      (showRecentHosts && recentHosts.length > 0)
+    );
+  }, [
+    selectedGroupPath,
+    viewMode,
+    search,
+    selectedTags.length,
+    visibleDisplayedHosts.length,
+    displayedGroups.length,
+    pinnedHosts.length,
+    showRecentHosts,
+    recentHosts.length,
+  ]);
 
   // Known Hosts callbacks - use refs to keep stable references
   // Store latest values in refs so callbacks don't need to depend on them
@@ -2552,23 +2593,25 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
           className={cn(
             "bg-secondary/80 border-r border-border/60 flex flex-col transition-all duration-200",
             sidebarCollapsed ? "w-14" : "w-52",
-            isDatabaseTabActive && "hidden",
+            isDatabaseTabActive && "hidden"
           )}
           data-section="vault-sidebar"
         >
           <div className={cn(
-            "py-4 flex items-center",
+            "pt-5 pb-6 flex items-center",
             sidebarCollapsed ? "px-2 justify-center" : "px-4"
           )}>
             <Tooltip delayDuration={500}>
               <TooltipTrigger asChild>
                 <button
                   onClick={() => setSidebarCollapsed(!sidebarCollapsed)}
-                  className="flex items-center gap-3 hover:opacity-80 transition-opacity"
+                  className="flex items-center gap-2.5 hover:opacity-80 transition-opacity"
                 >
-                  <AppLogo className="h-10 w-10 rounded-xl flex-shrink-0" />
+                  <AppLogo className="h-8 w-8 flex-shrink-0" />
                   {!sidebarCollapsed && (
-                    <p className="text-sm font-bold text-foreground">Netcatty</p>
+                    <p className="text-xl font-black italic tracking-tight text-foreground leading-none">
+                      Netcatty
+                    </p>
                   )}
                 </button>
               </TooltipTrigger>
@@ -2581,7 +2624,7 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
           <div className={cn("space-y-1", sidebarCollapsed ? "px-1.5" : "px-3")}>
             <Tooltip>
               <TooltipTrigger asChild>
-                <Button
+                <RippleButton
                   variant={currentSection === "hosts" ? "secondary" : "ghost"}
                   className={cn(
                     "w-full h-10",
@@ -2596,13 +2639,13 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
                 >
                   <LayoutGrid size={16} className="flex-shrink-0" />
                   {!sidebarCollapsed && t("vault.nav.hosts")}
-                </Button>
+                </RippleButton>
               </TooltipTrigger>
               {sidebarCollapsed && <TooltipContent side="right">{t("vault.nav.hosts")}</TooltipContent>}
             </Tooltip>
             <Tooltip>
               <TooltipTrigger asChild>
-                <Button
+                <RippleButton
                   variant={currentSection === "keys" ? "secondary" : "ghost"}
                   className={cn(
                     "w-full h-10",
@@ -2616,13 +2659,13 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
                 >
                   <Key size={16} className="flex-shrink-0" />
                   {!sidebarCollapsed && t("vault.nav.keychain")}
-                </Button>
+                </RippleButton>
               </TooltipTrigger>
               {sidebarCollapsed && <TooltipContent side="right">{t("vault.nav.keychain")}</TooltipContent>}
             </Tooltip>
             <Tooltip>
               <TooltipTrigger asChild>
-                <Button
+                <RippleButton
                   variant={currentSection === "port" ? "secondary" : "ghost"}
                   className={cn(
                     "w-full h-10",
@@ -2634,13 +2677,13 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
                 >
                   <Plug size={16} className="flex-shrink-0" />
                   {!sidebarCollapsed && t("vault.nav.portForwarding")}
-                </Button>
+                </RippleButton>
               </TooltipTrigger>
               {sidebarCollapsed && <TooltipContent side="right">{t("vault.nav.portForwarding")}</TooltipContent>}
             </Tooltip>
             <Tooltip>
               <TooltipTrigger asChild>
-                <Button
+                <RippleButton
                   variant={currentSection === "snippets" ? "secondary" : "ghost"}
                   className={cn(
                     "w-full h-10",
@@ -2654,13 +2697,13 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
                 >
                   <FileCode size={16} className="flex-shrink-0" />
                   {!sidebarCollapsed && t("vault.nav.snippets")}
-                </Button>
+                </RippleButton>
               </TooltipTrigger>
               {sidebarCollapsed && <TooltipContent side="right">{t("vault.nav.snippets")}</TooltipContent>}
             </Tooltip>
             <Tooltip>
               <TooltipTrigger asChild>
-                <Button
+                <RippleButton
                   variant={currentSection === "knownhosts" ? "secondary" : "ghost"}
                   className={cn(
                     "w-full h-10",
@@ -2672,13 +2715,13 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
                 >
                   <BookMarked size={16} className="flex-shrink-0" />
                   {!sidebarCollapsed && t("vault.nav.knownHosts")}
-                </Button>
+                </RippleButton>
               </TooltipTrigger>
               {sidebarCollapsed && <TooltipContent side="right">{t("vault.nav.knownHosts")}</TooltipContent>}
             </Tooltip>
             <Tooltip>
               <TooltipTrigger asChild>
-                <Button
+                <RippleButton
                   variant={currentSection === "logs" ? "secondary" : "ghost"}
                   className={cn(
                     "w-full h-10",
@@ -2690,7 +2733,7 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
                 >
                   <Activity size={16} className="flex-shrink-0" />
                   {!sidebarCollapsed && t("vault.nav.logs")}
-                </Button>
+                </RippleButton>
               </TooltipTrigger>
               {sidebarCollapsed && <TooltipContent side="right">{t("vault.nav.logs")}</TooltipContent>}
             </Tooltip>
@@ -2937,6 +2980,52 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
             </div>
           </div>
         </header>
+
+        {isMultiSelectMode && isHostsSectionActive && (
+          <div className="px-4 py-1.5 bg-background border-b border-border/40 flex items-center gap-2">
+            <span className="flex items-center h-7 text-xs text-muted-foreground leading-none">
+              {t("vault.hosts.selected", { count: selectedHostIds.size })}
+            </span>
+            <div className="flex-1" />
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 px-2 text-xs"
+              onClick={() => {
+                const allIds = new Set(displayedHosts.map(h => h.id));
+                setSelectedHostIds(allIds);
+              }}
+            >
+              {t("vault.hosts.selectAll")}
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 px-2 text-xs"
+              onClick={clearHostSelection}
+            >
+              {t("vault.hosts.deselectAll")}
+            </Button>
+            <Button
+              variant="destructive"
+              size="sm"
+              className="h-7 px-2 text-xs"
+              disabled={selectedHostIds.size === 0}
+              onClick={deleteSelectedHosts}
+            >
+              <Trash2 size={12} className="mr-1" />
+              {t("vault.hosts.deleteSelected", { count: selectedHostIds.size })}
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-7 w-7"
+              onClick={clearHostSelection}
+            >
+              <X size={12} />
+            </Button>
+          </div>
+        )}
 
         {/* Keep hosts mounted so switching sections does not reset scroll or remount the list. */}
         <div
@@ -3363,6 +3452,7 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
                   )}
                 </section>
 
+                {!shouldHideEmptyRootHostsSection && (
                 <section className="space-y-2">
                   <div className="flex items-center justify-between">
                     <h3 className="text-sm font-semibold text-muted-foreground">
@@ -3381,49 +3471,6 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
                       </div>
                     </div>
                   </div>
-
-                  {isMultiSelectMode && (
-                    <div className="flex items-center gap-2 p-2 bg-secondary/60 rounded-lg border border-border/40">
-                      <span className="text-sm text-muted-foreground">
-                        {t("vault.hosts.selected", { count: selectedHostIds.size })}
-                      </span>
-                      <div className="flex-1" />
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        onClick={() => {
-                          const allIds = new Set(displayedHosts.map(h => h.id));
-                          setSelectedHostIds(allIds);
-                        }}
-                      >
-                        {t("vault.hosts.selectAll")}
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        onClick={clearHostSelection}
-                      >
-                        {t("vault.hosts.deselectAll")}
-                      </Button>
-                      <Button
-                        variant="destructive"
-                        size="sm"
-                        disabled={selectedHostIds.size === 0}
-                        onClick={deleteSelectedHosts}
-                      >
-                        <Trash2 size={14} className="mr-1" />
-                        {t("vault.hosts.deleteSelected", { count: selectedHostIds.size })}
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className="h-8 w-8"
-                        onClick={clearHostSelection}
-                      >
-                        <X size={14} />
-                      </Button>
-                    </div>
-                  )}
 
                   {viewMode === "tree" ? (
                     <HostTreeView
@@ -3645,7 +3692,7 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
                       )}
                       style={viewMode === "grid" ? splitViewGridStyle : undefined}
                     >
-                      {displayedHosts.filter((h) => selectedGroupPath || !pinnedRecentIds.has(h.id)).map((host) => {
+                      {visibleDisplayedHosts.map((host) => {
                           const safeHost = sanitizeHost(host);
                           const effectiveDistro = getEffectiveHostDistro(safeHost);
                           const distroBadge = {
@@ -3778,6 +3825,7 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
                     </div>
                   )}
                 </section>
+                )}
         </div>
 
         {currentSection === "snippets" && (
@@ -3988,13 +4036,7 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
           groupDefaults={editingHostGroupDefaults}
           groupConfigs={groupConfigs}
           onSave={(host) => {
-            // Check if host already exists in the list (for updates vs. new/duplicate)
-            const hostExists = hosts.some((h) => h.id === host.id);
-            onUpdateHosts(
-              hostExists
-                ? hosts.map((h) => (h.id === host.id ? host : h))
-                : [...hosts, host],
-            );
+            onUpdateHosts(upsertHostById(hosts, host));
             setIsHostPanelOpen(false);
             setEditingHost(null);
             setNewHostGroupPath(null);
@@ -4034,15 +4076,15 @@ const VaultViewInner: React.FC<VaultViewProps> = ({
           allTags={allTags}
           groups={allGroupPaths}
           onSave={(host) => {
-            onUpdateHosts(
-              hosts.map((h) => (h.id === host.id ? host : h)),
-            );
+            onUpdateHosts(upsertHostById(hosts, host));
             setIsHostPanelOpen(false);
             setEditingHost(null);
+            setNewHostGroupPath(null);
           }}
           onCancel={() => {
             setIsHostPanelOpen(false);
             setEditingHost(null);
+            setNewHostGroupPath(null);
           }}
           layout="inline"
         />

@@ -18,6 +18,8 @@ import {
   STORAGE_KEY_AI_WEB_SEARCH,
 } from '../../infrastructure/config/storageKeys';
 import type {
+  AIDraft,
+  AIPanelView,
   AISession,
   AIPermissionMode,
   AIToolIntegrationMode,
@@ -29,6 +31,21 @@ import type {
   WebSearchConfig,
 } from '../../infrastructure/ai/types';
 import { DEFAULT_COMMAND_BLOCKLIST } from '../../infrastructure/ai/types';
+import {
+  activateDraftView,
+  bumpDraftMutationVersionState,
+  bumpDraftUploadGenerationState,
+  clearScopeDraftState,
+  ensureDraftForScopeState,
+  getDraftUploadGenerationState,
+  setSessionView,
+  updateDraftForScope,
+} from './aiDraftState';
+import {
+  pruneInactiveScopedSessions,
+  pruneInactiveScopedTransientState,
+} from './aiScopeCleanup';
+import { convertFilesToUploads } from './useFileUpload';
 
 /** Typed accessor for the Electron IPC bridge exposed on `window.netcatty`. */
 interface AIBridge {
@@ -45,6 +62,11 @@ function getAIBridge() {
 }
 
 const AI_STATE_CHANGED_EVENT = 'netcatty:ai-state-changed';
+const AI_STATE_CHANGED_DRAFTS_BY_SCOPE = 'netcatty:ai-drafts-by-scope';
+const AI_STATE_CHANGED_PANEL_VIEW_BY_SCOPE = 'netcatty:ai-panel-view-by-scope';
+
+type DraftsByScope = Partial<Record<string, AIDraft>>;
+type PanelViewByScope = Partial<Record<string, AIPanelView>>;
 
 function emitAIStateChanged(key: string) {
   window.dispatchEvent(new CustomEvent<{ key: string }>(AI_STATE_CHANGED_EVENT, { detail: { key } }));
@@ -72,53 +94,41 @@ export function cleanupOrphanedAISessions(activeTargetIds: Set<string>) {
   const currentSessions = latestAISessionsSnapshot
     ?? localStorageAdapter.read<AISession[]>(STORAGE_KEY_AI_SESSIONS)
     ?? [];
-  const orphanedSessionIds = currentSessions
-    .filter((session) => session.scope.targetId && !activeTargetIds.has(session.scope.targetId))
-    .map((session) => session.id);
 
-  if (orphanedSessionIds.length > 0) {
-    const orphanedSessionIdSet = new Set(orphanedSessionIds);
-
-    // Determine which sessions can be restored via host-based matching
-    const preservedIds = new Set<string>();
-    for (const session of currentSessions) {
-      if (!orphanedSessionIdSet.has(session.id)) continue;
-      // Only preserve remote terminal sessions with real hostIds
-      const isRestorable = session.scope.type === 'terminal'
-        && session.scope.hostIds?.length
-        && session.scope.hostIds.some((id) => !id.startsWith('local-') && !id.startsWith('serial-'));
-      if (isRestorable) {
-        preservedIds.add(session.id);
-      }
-    }
-
-    // Cleanup ACP sessions for all orphans (both deleted and preserved).
-    // Preserved sessions will get a new externalSessionId on next use,
-    // so cleaning the old one is safe and prevents subprocess leaks.
-    cleanupAcpSessions(orphanedSessionIds);
-
-    const nextSessions = currentSessions
-      .filter((session) => !orphanedSessionIdSet.has(session.id) || preservedIds.has(session.id))
-      .map((session) => {
-        if (!preservedIds.has(session.id) || !session.externalSessionId) {
-          return session;
-        }
-        // Drop transient ACP session handles so the next turn starts cleanly.
-        return { ...session, externalSessionId: undefined };
-      });
-
-    const sessionsChanged = nextSessions.length !== currentSessions.length
-      || nextSessions.some((session, index) => session !== currentSessions[index]);
-    if (sessionsChanged) {
-      setLatestAISessionsSnapshot(nextSessions);
-      localStorageAdapter.write(STORAGE_KEY_AI_SESSIONS, pruneSessionsForStorage(nextSessions));
-      emitAIStateChanged(STORAGE_KEY_AI_SESSIONS);
-    }
-  }
-
-  const activeSessionIdMap = latestAIActiveSessionMapSnapshot
+  // Sessions shown by a still-live scope must be protected from cleanup
+  // even when their own `scope.targetId` points at a closed terminal —
+  // history can be resumed into a different terminal and we must not
+  // delete it outright while it's actively being used.
+  const preCleanupActiveSessionMap = latestAIActiveSessionMapSnapshot
     ?? localStorageAdapter.read<Record<string, string | null>>(STORAGE_KEY_AI_ACTIVE_SESSION_MAP)
     ?? {};
+  const activeSessionIds = new Set<string>();
+  for (const [scopeKey, sessionId] of Object.entries(preCleanupActiveSessionMap)) {
+    if (!sessionId) continue;
+    if (!isScopeKeyActive(scopeKey, activeTargetIds)) continue;
+    activeSessionIds.add(sessionId);
+  }
+
+  const nextSessionCleanup = pruneInactiveScopedSessions(
+    currentSessions,
+    activeTargetIds,
+    activeSessionIds,
+  );
+
+  if (nextSessionCleanup.orphanedSessionIds.length > 0) {
+    cleanupAcpSessions(nextSessionCleanup.orphanedSessionIds);
+  }
+
+  if (nextSessionCleanup.sessions !== currentSessions) {
+    setLatestAISessionsSnapshot(nextSessionCleanup.sessions);
+    localStorageAdapter.write(
+      STORAGE_KEY_AI_SESSIONS,
+      pruneSessionsForStorage(nextSessionCleanup.sessions),
+    );
+    emitAIStateChanged(STORAGE_KEY_AI_SESSIONS);
+  }
+
+  const activeSessionIdMap = preCleanupActiveSessionMap;
   let activeSessionMapChanged = false;
   const nextActiveSessionIdMap = { ...activeSessionIdMap };
 
@@ -132,6 +142,46 @@ export function cleanupOrphanedAISessions(activeTargetIds: Set<string>) {
     setLatestAIActiveSessionMapSnapshot(nextActiveSessionIdMap);
     localStorageAdapter.write(STORAGE_KEY_AI_ACTIVE_SESSION_MAP, nextActiveSessionIdMap);
     emitAIStateChanged(STORAGE_KEY_AI_ACTIVE_SESSION_MAP);
+  }
+
+  const currentActiveSessionIdMap = activeSessionMapChanged
+    ? nextActiveSessionIdMap
+    : activeSessionIdMap;
+  const currentDraftsByScope = latestAIDraftsByScopeSnapshot ?? {};
+  const currentPanelViewByScope = latestAIPanelViewByScopeSnapshot ?? {};
+  const prunedScopedTransientState = pruneInactiveScopedTransientState(
+    currentActiveSessionIdMap,
+    currentDraftsByScope,
+    currentPanelViewByScope,
+    activeTargetIds,
+  );
+
+  if (prunedScopedTransientState.activeSessionIdMap !== currentActiveSessionIdMap) {
+    setLatestAIActiveSessionMapSnapshot(prunedScopedTransientState.activeSessionIdMap);
+    localStorageAdapter.write(
+      STORAGE_KEY_AI_ACTIVE_SESSION_MAP,
+      prunedScopedTransientState.activeSessionIdMap,
+    );
+    emitAIStateChanged(STORAGE_KEY_AI_ACTIVE_SESSION_MAP);
+  }
+
+  if (prunedScopedTransientState.draftsByScope !== currentDraftsByScope) {
+    for (const scopeKey of Object.keys(currentDraftsByScope)) {
+      if (scopeKey in prunedScopedTransientState.draftsByScope) continue;
+      bumpDraftMutationVersion(scopeKey);
+      bumpDraftUploadGeneration(scopeKey);
+    }
+    setLatestAIDraftsByScopeSnapshot(prunedScopedTransientState.draftsByScope);
+    emitAIStateChanged(AI_STATE_CHANGED_DRAFTS_BY_SCOPE);
+  }
+
+  if (prunedScopedTransientState.panelViewByScope !== currentPanelViewByScope) {
+    for (const scopeKey of Object.keys(currentPanelViewByScope)) {
+      if (scopeKey in prunedScopedTransientState.panelViewByScope) continue;
+      bumpDraftMutationVersion(scopeKey);
+    }
+    setLatestAIPanelViewByScopeSnapshot(prunedScopedTransientState.panelViewByScope);
+    emitAIStateChanged(AI_STATE_CHANGED_PANEL_VIEW_BY_SCOPE);
   }
 }
 
@@ -163,6 +213,10 @@ function pruneSessionsForStorage(sessions: AISession[]): AISession[] {
 
 let latestAISessionsSnapshot: AISession[] | null = null;
 let latestAIActiveSessionMapSnapshot: Record<string, string | null> | null = null;
+let latestAIDraftsByScopeSnapshot: DraftsByScope | null = null;
+let latestAIPanelViewByScopeSnapshot: PanelViewByScope | null = null;
+let latestAIDraftMutationVersionByScopeSnapshot: Record<string, number> = {};
+let latestAIDraftUploadGenerationByScopeSnapshot: Record<string, number> = {};
 
 function setLatestAISessionsSnapshot(sessions: AISession[]) {
   latestAISessionsSnapshot = sessions;
@@ -172,17 +226,33 @@ function setLatestAIActiveSessionMapSnapshot(activeSessionIdMap: Record<string, 
   latestAIActiveSessionMapSnapshot = activeSessionIdMap;
 }
 
-function buildScopeKey(scope: AISessionScope) {
-  return `${scope.type}:${scope.targetId ?? ''}`;
+function setLatestAIDraftsByScopeSnapshot(draftsByScope: DraftsByScope) {
+  latestAIDraftsByScopeSnapshot = draftsByScope;
 }
 
-function areHostIdsEqual(left?: string[], right?: string[]) {
-  const leftIds = left ?? [];
-  const rightIds = right ?? [];
-  if (leftIds.length !== rightIds.length) return false;
+function setLatestAIPanelViewByScopeSnapshot(panelViewByScope: PanelViewByScope) {
+  latestAIPanelViewByScopeSnapshot = panelViewByScope;
+}
 
-  const rightSet = new Set(rightIds);
-  return leftIds.every((hostId) => rightSet.has(hostId));
+function bumpDraftMutationVersion(scopeKey: string) {
+  latestAIDraftMutationVersionByScopeSnapshot = bumpDraftMutationVersionState(
+    latestAIDraftMutationVersionByScopeSnapshot,
+    scopeKey,
+  );
+}
+
+function getDraftUploadGeneration(scopeKey: string) {
+  return getDraftUploadGenerationState(
+    latestAIDraftUploadGenerationByScopeSnapshot,
+    scopeKey,
+  );
+}
+
+function bumpDraftUploadGeneration(scopeKey: string) {
+  latestAIDraftUploadGenerationByScopeSnapshot = bumpDraftUploadGenerationState(
+    latestAIDraftUploadGenerationByScopeSnapshot,
+    scopeKey,
+  );
 }
 
 export function useAIState() {
@@ -243,6 +313,14 @@ export function useAIState() {
   const [activeSessionIdMap, setActiveSessionIdMapRaw] = useState<Record<string, string | null>>(() =>
     localStorageAdapter.read<Record<string, string | null>>(STORAGE_KEY_AI_ACTIVE_SESSION_MAP) ?? {}
   );
+  // Per-scope draft/view state is intentionally memory-only so a relaunch
+  // does not restore stale composer input or panel intent against new history.
+  const [draftsByScope, setDraftsByScopeRaw] = useState<DraftsByScope>(() =>
+    latestAIDraftsByScopeSnapshot ?? {}
+  );
+  const [panelViewByScope, setPanelViewByScopeRaw] = useState<PanelViewByScope>(() =>
+    latestAIPanelViewByScopeSnapshot ?? {}
+  );
 
   // Per-agent model selection: remembers last selected model per agent
   const [agentModelMap, setAgentModelMapRaw] = useState<Record<string, string>>(() =>
@@ -261,6 +339,14 @@ export function useAIState() {
   useEffect(() => {
     setLatestAIActiveSessionMapSnapshot(activeSessionIdMap);
   }, [activeSessionIdMap]);
+
+  useEffect(() => {
+    setLatestAIDraftsByScopeSnapshot(draftsByScope);
+  }, [draftsByScope]);
+
+  useEffect(() => {
+    setLatestAIPanelViewByScopeSnapshot(panelViewByScope);
+  }, [panelViewByScope]);
 
   useEffect(() => {
     const validSessionIds = new Set(sessions.map((session) => session.id));
@@ -284,13 +370,39 @@ export function useAIState() {
   }, [sessions, activeSessionIdMap]);
 
   const setActiveSessionId = useCallback((scopeKey: string, id: string | null) => {
+    let nextActiveSessionIdMap: Record<string, string | null> | null = null;
+
     setActiveSessionIdMapRaw(prev => {
+      if (prev[scopeKey] === id) {
+        return prev;
+      }
+
       const next = { ...prev, [scopeKey]: id };
-      setLatestAIActiveSessionMapSnapshot(next);
-      localStorageAdapter.write(STORAGE_KEY_AI_ACTIVE_SESSION_MAP, next);
-      emitAIStateChanged(STORAGE_KEY_AI_ACTIVE_SESSION_MAP);
+      nextActiveSessionIdMap = next;
       return next;
     });
+
+    if (!nextActiveSessionIdMap) return;
+
+    setLatestAIActiveSessionMapSnapshot(nextActiveSessionIdMap);
+    localStorageAdapter.write(STORAGE_KEY_AI_ACTIVE_SESSION_MAP, nextActiveSessionIdMap);
+    emitAIStateChanged(STORAGE_KEY_AI_ACTIVE_SESSION_MAP);
+  }, []);
+
+  const setPanelViewByScope = useCallback((value: PanelViewByScope | ((prev: PanelViewByScope) => PanelViewByScope)) => {
+    let nextPanelViewByScope: PanelViewByScope | null = null;
+
+    setPanelViewByScopeRaw((prev) => {
+      const next = typeof value === 'function' ? value(prev) : value;
+      if (next === prev) return prev;
+      nextPanelViewByScope = next;
+      return next;
+    });
+
+    if (!nextPanelViewByScope) return;
+
+    setLatestAIPanelViewByScopeSnapshot(nextPanelViewByScope);
+    emitAIStateChanged(AI_STATE_CHANGED_PANEL_VIEW_BY_SCOPE);
   }, []);
 
   const setAgentModel = useCallback((agentId: string, modelId: string) => {
@@ -522,6 +634,12 @@ export function useAIState() {
               ?? {},
           );
           return;
+        case AI_STATE_CHANGED_DRAFTS_BY_SCOPE:
+          setDraftsByScopeRaw(latestAIDraftsByScopeSnapshot ?? {});
+          return;
+        case AI_STATE_CHANGED_PANEL_VIEW_BY_SCOPE:
+          setPanelViewByScopeRaw(latestAIPanelViewByScopeSnapshot ?? {});
+          return;
         default:
           handleStorage({ key } as StorageEvent);
       }
@@ -686,61 +804,6 @@ export function useAIState() {
     });
   }, [debouncedPersistSessions]);
 
-  const retargetSessionScope = useCallback((sessionId: string, scope: AISessionScope) => {
-    const currentSession = sessionsRef.current.find((session) => session.id === sessionId);
-    if (!currentSession) return;
-
-    const currentScope = currentSession.scope;
-    const scopeChanged =
-      currentScope.type !== scope.type
-      || currentScope.targetId !== scope.targetId
-      || !areHostIdsEqual(currentScope.hostIds, scope.hostIds);
-
-    const nextScopeKey = buildScopeKey(scope);
-    const currentScopeKey = buildScopeKey(currentScope);
-
-    if (scopeChanged) {
-      setSessionsRaw((prev) => {
-        let changed = false;
-        const next = prev.map((session) => {
-          if (session.id !== sessionId) return session;
-          changed = true;
-          // Clear stale ACP handle — retarget may run before orphan cleanup
-          return { ...session, scope, externalSessionId: undefined };
-        });
-
-        if (!changed) return prev;
-
-        sessionsRef.current = next;
-        setLatestAISessionsSnapshot(next);
-        persistSessions(next);
-        return next;
-      });
-    }
-
-    setActiveSessionIdMapRaw((prev) => {
-      let changed = false;
-      const next = { ...prev };
-
-      if (currentScopeKey !== nextScopeKey && next[currentScopeKey] === sessionId) {
-        delete next[currentScopeKey];
-        changed = true;
-      }
-
-      if (next[nextScopeKey] !== sessionId) {
-        next[nextScopeKey] = sessionId;
-        changed = true;
-      }
-
-      if (!changed) return prev;
-
-      setLatestAIActiveSessionMapSnapshot(next);
-      localStorageAdapter.write(STORAGE_KEY_AI_ACTIVE_SESSION_MAP, next);
-      emitAIStateChanged(STORAGE_KEY_AI_ACTIVE_SESSION_MAP);
-      return next;
-    });
-  }, [persistSessions]);
-
   // Maximum messages per session to prevent unbounded memory growth
   const MAX_MESSAGES_PER_SESSION = 500;
 
@@ -808,14 +871,193 @@ export function useAIState() {
     });
   }, [persistSessions]);
 
+  const ensureDraftForScope = useCallback((scopeKey: string, agentId: string): void => {
+    let nextDraftsByScope: DraftsByScope | null = null;
+
+    setDraftsByScopeRaw((prev) => {
+      const next = ensureDraftForScopeState(prev, scopeKey, agentId);
+      if (next === prev) return prev;
+      nextDraftsByScope = next;
+      return next;
+    });
+
+    if (!nextDraftsByScope) return;
+
+    bumpDraftMutationVersion(scopeKey);
+    setLatestAIDraftsByScopeSnapshot(nextDraftsByScope);
+    emitAIStateChanged(AI_STATE_CHANGED_DRAFTS_BY_SCOPE);
+  }, []);
+
+  const updateDraft = useCallback((
+    scopeKey: string,
+    fallbackAgentId: string,
+    updater: (draft: AIDraft) => AIDraft,
+  ): void => {
+    setDraftsByScopeRaw((prev) => {
+      const next = updateDraftForScope(
+        prev,
+        scopeKey,
+        fallbackAgentId,
+        (draft) => {
+          return {
+            ...updater(draft),
+            updatedAt: Date.now(),
+          };
+        },
+      );
+      setLatestAIDraftsByScopeSnapshot(next);
+      emitAIStateChanged(AI_STATE_CHANGED_DRAFTS_BY_SCOPE);
+      return next;
+    });
+    bumpDraftMutationVersion(scopeKey);
+  }, []);
+
+  const updateDraftIfPresent = useCallback((
+    scopeKey: string,
+    updater: (draft: AIDraft) => AIDraft,
+  ): void => {
+    let updated = false;
+
+    setDraftsByScopeRaw((prev) => {
+      const currentDraft = prev[scopeKey];
+      if (!currentDraft) return prev;
+
+      const nextDraft = {
+        ...updater(currentDraft),
+        updatedAt: Date.now(),
+      };
+      const next = {
+        ...prev,
+        [scopeKey]: nextDraft,
+      };
+      updated = true;
+      setLatestAIDraftsByScopeSnapshot(next);
+      emitAIStateChanged(AI_STATE_CHANGED_DRAFTS_BY_SCOPE);
+      return next;
+    });
+
+    if (updated) {
+      bumpDraftMutationVersion(scopeKey);
+    }
+  }, []);
+
+  const showDraftView = useCallback((scopeKey: string) => {
+    const currentPanelViewByScope = panelViewByScope;
+    let nextActiveSessionIdMap: Record<string, string | null> | null = null;
+    let nextPanelViewByScope: PanelViewByScope | null = null;
+    let activeSessionMapChanged = false;
+    let panelViewChanged = false;
+
+    setActiveSessionIdMapRaw((prevActiveSessionIdMap) => {
+      const next = activateDraftView(
+        prevActiveSessionIdMap,
+        currentPanelViewByScope,
+        scopeKey,
+      );
+      activeSessionMapChanged = next.activeSessionIdMap !== prevActiveSessionIdMap;
+      panelViewChanged = next.panelViewByScope !== currentPanelViewByScope;
+      nextActiveSessionIdMap = next.activeSessionIdMap;
+      nextPanelViewByScope = next.panelViewByScope;
+      return activeSessionMapChanged ? next.activeSessionIdMap : prevActiveSessionIdMap;
+    });
+
+    if (activeSessionMapChanged && nextActiveSessionIdMap) {
+      setLatestAIActiveSessionMapSnapshot(nextActiveSessionIdMap);
+      localStorageAdapter.write(STORAGE_KEY_AI_ACTIVE_SESSION_MAP, nextActiveSessionIdMap);
+      emitAIStateChanged(STORAGE_KEY_AI_ACTIVE_SESSION_MAP);
+    }
+
+    if (panelViewChanged && nextPanelViewByScope) {
+      setLatestAIPanelViewByScopeSnapshot(nextPanelViewByScope);
+      setPanelViewByScopeRaw(nextPanelViewByScope);
+      emitAIStateChanged(AI_STATE_CHANGED_PANEL_VIEW_BY_SCOPE);
+    }
+  }, [panelViewByScope]);
+
+  const showSessionView = useCallback((scopeKey: string, sessionId: string) => {
+    setPanelViewByScope((prev) => setSessionView(prev, scopeKey, sessionId));
+  }, [setPanelViewByScope]);
+
+  const clearDraftForScope = useCallback((scopeKey: string) => {
+    const currentPanelViewByScope = panelViewByScope;
+    let nextDraftsByScope: DraftsByScope | null = null;
+    let nextPanelViewByScope: PanelViewByScope | null = null;
+    let draftsChanged = false;
+    let panelViewChanged = false;
+
+    setDraftsByScopeRaw((prevDraftsByScope) => {
+      const next = clearScopeDraftState(
+        prevDraftsByScope,
+        currentPanelViewByScope,
+        scopeKey,
+      );
+      draftsChanged = next.draftsByScope !== prevDraftsByScope;
+      panelViewChanged = next.panelViewByScope !== currentPanelViewByScope;
+      nextDraftsByScope = next.draftsByScope;
+      nextPanelViewByScope = next.panelViewByScope;
+      return draftsChanged ? next.draftsByScope : prevDraftsByScope;
+    });
+
+    if (!draftsChanged && !panelViewChanged) return;
+
+    bumpDraftMutationVersion(scopeKey);
+    bumpDraftUploadGeneration(scopeKey);
+
+    if (draftsChanged && nextDraftsByScope) {
+      setLatestAIDraftsByScopeSnapshot(nextDraftsByScope);
+      emitAIStateChanged(AI_STATE_CHANGED_DRAFTS_BY_SCOPE);
+    }
+
+    if (panelViewChanged && nextPanelViewByScope) {
+      setLatestAIPanelViewByScopeSnapshot(nextPanelViewByScope);
+      setPanelViewByScopeRaw(nextPanelViewByScope);
+      emitAIStateChanged(AI_STATE_CHANGED_PANEL_VIEW_BY_SCOPE);
+    }
+  }, [panelViewByScope]);
+
+  const addDraftFiles = useCallback(async (
+    scopeKey: string,
+    fallbackAgentId: string,
+    inputFiles: File[],
+  ) => {
+    ensureDraftForScope(scopeKey, fallbackAgentId);
+    const initialUploadGeneration = getDraftUploadGeneration(scopeKey);
+    const uploads = await convertFilesToUploads(inputFiles);
+    if (uploads.length === 0) return;
+
+    if (getDraftUploadGeneration(scopeKey) !== initialUploadGeneration) {
+      return;
+    }
+
+    updateDraftIfPresent(scopeKey, (draft) => ({
+      ...draft,
+      attachments: [...draft.attachments, ...uploads],
+    }));
+  }, [ensureDraftForScope, updateDraftIfPresent]);
+
+  const removeDraftFile = useCallback((scopeKey: string, fallbackAgentId: string, fileId: string) => {
+    updateDraft(scopeKey, fallbackAgentId, (draft) => ({
+      ...draft,
+      attachments: draft.attachments.filter((file) => file.id !== fileId),
+    }));
+  }, [updateDraft]);
+
   const cleanupOrphanedSessions = useCallback((activeTargetIds: Set<string>) => {
     cleanupOrphanedAISessions(activeTargetIds);
-    setSessionsRaw(latestAISessionsSnapshot ?? localStorageAdapter.read<AISession[]>(STORAGE_KEY_AI_SESSIONS) ?? []);
+
+    const nextSessions =
+      latestAISessionsSnapshot
+      ?? localStorageAdapter.read<AISession[]>(STORAGE_KEY_AI_SESSIONS)
+      ?? [];
+    sessionsRef.current = nextSessions;
+    setSessionsRaw(nextSessions);
     setActiveSessionIdMapRaw(
       latestAIActiveSessionMapSnapshot
         ?? localStorageAdapter.read<Record<string, string | null>>(STORAGE_KEY_AI_ACTIVE_SESSION_MAP)
         ?? {},
     );
+    setDraftsByScopeRaw(latestAIDraftsByScopeSnapshot ?? {});
+    setPanelViewByScopeRaw(latestAIPanelViewByScopeSnapshot ?? {});
   }, []);
 
   // ── Provider CRUD helpers ──
@@ -889,13 +1131,21 @@ export function useAIState() {
     // Sessions (per-scope active session)
     sessions,
     activeSessionIdMap,
+    draftsByScope,
+    panelViewByScope,
     setActiveSessionId,
+    ensureDraftForScope,
+    updateDraft,
+    showDraftView,
+    showSessionView,
+    clearDraftForScope,
+    addDraftFiles,
+    removeDraftFile,
     createSession,
     deleteSession,
     deleteSessionsByTarget,
     updateSessionTitle,
     updateSessionExternalSessionId,
-    retargetSessionScope,
     addMessageToSession,
     updateLastMessage,
     updateMessageById,

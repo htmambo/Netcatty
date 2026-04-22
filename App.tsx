@@ -18,14 +18,24 @@ import { resolveGroupDefaults, applyGroupDefaults } from './domain/groupConfig';
 import { resolveHostAuth } from './domain/sshAuth';
 import { resolveHostTerminalThemeId } from './domain/terminalAppearance';
 import { collectSessionIds } from './domain/workspace';
+import { resolveCloseIntent } from './application/state/resolveCloseIntent';
 import { TERMINAL_THEMES } from './infrastructure/config/terminalThemes';
 import { useCustomThemes } from './application/state/customThemeStore';
-import { applySyncPayload } from './application/syncPayload';
+import type { SyncPayload } from './domain/sync';
+import { applySyncPayload, buildSyncPayload, hasMeaningfulSyncData } from './application/syncPayload';
+import {
+  applyProtectedSyncPayload,
+  ensureVersionChangeBackup,
+} from './application/localVaultBackups';
 import { getCredentialProtectionAvailability } from './infrastructure/services/credentialProtection';
 import { netcattyBridge } from './infrastructure/services/netcattyBridge';
 import { localStorageAdapter } from './infrastructure/persistence/localStorageAdapter';
 import { AlertTriangle, Download, Trash2 } from 'lucide-react';
-import { STORAGE_KEY_DEBUG_HOTKEYS } from './infrastructure/config/storageKeys';
+import {
+  STORAGE_KEY_DEBUG_HOTKEYS,
+  STORAGE_KEY_PORT_FORWARDING,
+} from './infrastructure/config/storageKeys';
+import { getEffectiveKnownHosts } from './infrastructure/syncHelpers';
 import { TopTabs } from './components/TopTabs';
 import { Button } from './components/ui/button';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from './components/ui/dialog';
@@ -34,6 +44,7 @@ import { Label } from './components/ui/label';
 import { ToastProvider, toast } from './components/ui/toast';
 import { VaultView, VaultSection } from './components/VaultView';
 import { QuickAddSnippetDialog } from './components/QuickAddSnippetDialog';
+import { AddToWorkspaceDialog } from './components/workspace/AddToWorkspaceDialog';
 import { KeyboardInteractiveModal, KeyboardInteractiveRequest } from './components/KeyboardInteractiveModal';
 import { PassphraseModal, PassphraseRequest } from './components/PassphraseModal';
 import { cn } from './lib/utils';
@@ -169,6 +180,15 @@ function App({ settings }: { settings: SettingsState }) {
 
   const [isQuickSwitcherOpen, setIsQuickSwitcherOpen] = useState(false);
   const [isCreateWorkspaceOpen, setIsCreateWorkspaceOpen] = useState(false);
+  // Combined state for the AddToWorkspaceDialog. null = closed; mode
+  // determines whether picking targets appends them to an existing
+  // workspace (focus sidebar "+") or spins up a brand-new workspace
+  // tab (QuickSwitcher's New Workspace button).
+  const [addToWorkspaceDialog, setAddToWorkspaceDialog] = useState<
+    | { mode: 'append'; workspaceId: string }
+    | { mode: 'create' }
+    | null
+  >(null);
   const [quickSearch, setQuickSearch] = useState('');
   // Protocol selection dialog state for QuickSwitcher
   const [protocolSelectHost, setProtocolSelectHost] = useState<Host | null>(null);
@@ -237,6 +257,7 @@ function App({ settings }: { settings: SettingsState }) {
   }, [workspaceFocusStyle]);
 
   const {
+    isInitialized: isVaultInitialized,
     hosts,
     keys,
     identities,
@@ -296,6 +317,9 @@ function App({ settings }: { settings: SettingsState }) {
     createWorkspaceWithHosts,
     createWorkspaceFromSessions,
     addSessionToWorkspace,
+    appendHostToWorkspace,
+    appendLocalTerminalToWorkspace,
+    createWorkspaceFromTargets,
     updateSplitSizes,
     splitSession,
     toggleWorkspaceViewMode,
@@ -321,6 +345,12 @@ function App({ settings }: { settings: SettingsState }) {
   // ---------------------------------------------------------------------------
   const activeTabId = useActiveTabId();
   const customThemes = useCustomThemes();
+
+  useEffect(() => {
+    if (!settings.showSftpTab && activeTabId === 'sftp') {
+      setActiveTabId('vault');
+    }
+  }, [settings.showSftpTab, activeTabId, setActiveTabId]);
 
   // Resolve the effective TerminalTheme for the currently focused terminal tab
   const hostById = useMemo(
@@ -404,6 +434,129 @@ function App({ settings }: { settings: SettingsState }) {
     [portForwardingRules],
   );
 
+  const buildCurrentSyncPayload = useCallback(() => {
+    let effectivePortForwardingRules = portForwardingRulesForSync;
+    if (effectivePortForwardingRules.length === 0) {
+      const stored = localStorageAdapter.read<typeof portForwardingRulesForSync>(
+        STORAGE_KEY_PORT_FORWARDING,
+      );
+      if (stored && Array.isArray(stored) && stored.length > 0) {
+        effectivePortForwardingRules = stored.map((rule) => ({
+          ...rule,
+          status: 'inactive' as const,
+          error: undefined,
+          lastUsedAt: undefined,
+        }));
+      }
+    }
+
+    return buildSyncPayload(
+      {
+        hosts,
+        keys,
+        identities,
+        snippets,
+        customGroups,
+        snippetPackages,
+        knownHosts: getEffectiveKnownHosts(knownHosts),
+        groupConfigs,
+      },
+      effectivePortForwardingRules,
+    );
+  }, [
+    customGroups,
+    groupConfigs,
+    hosts,
+    identities,
+    keys,
+    knownHosts,
+    portForwardingRulesForSync,
+    snippetPackages,
+    snippets,
+  ]);
+
+  const [startupSyncSafetyReady, setStartupSyncSafetyReady] = useState(false);
+  // buildCurrentSyncPayload's identity changes each time the vault
+  // settles. The retry effect below watches the underlying data arrays
+  // for hydration progress, and uses the ref to always read the latest
+  // builder without pulling buildCurrentSyncPayload itself into deps
+  // (its identity churns on unrelated state updates too).
+  const buildCurrentSyncPayloadRef = useRef(buildCurrentSyncPayload);
+  useEffect(() => {
+    buildCurrentSyncPayloadRef.current = buildCurrentSyncPayload;
+  }, [buildCurrentSyncPayload]);
+
+  const versionBackupAttemptedRef = useRef(false);
+  // Two-stage gate: once the vault has initialized we open the auto-sync
+  // gate immediately — the hook's own hasMeaningfulSyncData guard and
+  // the cross-window restore barrier prevent an empty-but-not-yet-
+  // hydrated snapshot from overwriting cloud data. The version-change
+  // backup itself is best-effort and retries below as vault data arrives.
+  useEffect(() => {
+    if (isVaultInitialized && !startupSyncSafetyReady) {
+      setStartupSyncSafetyReady(true);
+    }
+  }, [isVaultInitialized, startupSyncSafetyReady]);
+
+  // Retry the version-change backup as hosts/keys/snippets become
+  // available. ensureVersionChangeBackup refuses to advance the stored
+  // version stamp when the observed payload is empty, so running this
+  // effect repeatedly is safe and eventually latches once the vault has
+  // hydrated enough to be backed up (or the user genuinely stays empty,
+  // in which case the effect continues to no-op).
+  useEffect(() => {
+    if (!isVaultInitialized || versionBackupAttemptedRef.current) return;
+    const payload = buildCurrentSyncPayloadRef.current();
+    if (!hasMeaningfulSyncData(payload)) return;
+    versionBackupAttemptedRef.current = true;
+
+    let cancelled = false;
+    void (async () => {
+      try {
+        const info = await netcattyBridge.get()?.getAppInfo?.();
+        await ensureVersionChangeBackup(payload, info?.version ?? null);
+      } catch (error) {
+        if (!cancelled) {
+          // Reset the latch so a later data change (or the next mount)
+          // can retry. ensureVersionChangeBackup already leaves the
+          // version stamp untouched on failure, so retrying is safe.
+          versionBackupAttemptedRef.current = false;
+        }
+        console.error('[App] Failed to create version-change backup:', error);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [isVaultInitialized, hosts, keys, identities, snippets, customGroups, snippetPackages, knownHosts]);
+
+  // Memoized "apply a remote payload safely" callback. Stable identity
+  // across renders so useAutoSync's `syncNow` useCallback doesn't rebuild
+  // on unrelated App-level state changes (which would churn the debounced
+  // auto-sync useEffect dep chain).
+  const handleApplySyncPayload = useCallback(
+    (payload: SyncPayload) =>
+      applyProtectedSyncPayload({
+        buildPreApplyPayload: () => buildCurrentSyncPayload(),
+        applyPayload: () =>
+          applySyncPayload(payload, {
+            importVaultData: importDataFromString,
+            importPortForwardingRules,
+            onSettingsApplied: settings.rehydrateAllFromStorage,
+          }),
+        translateProtectiveBackupFailure: (message) =>
+          t('cloudSync.localBackups.protectiveBackupFailed', { message }),
+      }),
+    [
+      buildCurrentSyncPayload,
+      importDataFromString,
+      importPortForwardingRules,
+      settings.rehydrateAllFromStorage,
+      t,
+    ],
+  );
+
   // Auto-sync hook for cloud sync
   const { syncNow: handleSyncNow, emptyVaultConflict, resolveEmptyVaultConflict } = useAutoSync({
     hosts,
@@ -416,13 +569,8 @@ function App({ settings }: { settings: SettingsState }) {
     knownHosts,
     groupConfigs,
     settingsVersion: settings.settingsVersion,
-    onApplyPayload: (payload) => {
-      applySyncPayload(payload, {
-        importVaultData: importDataFromString,
-        importPortForwardingRules,
-        onSettingsApplied: settings.rehydrateAllFromStorage,
-      });
-    },
+    startupReady: startupSyncSafetyReady,
+    onApplyPayload: handleApplySyncPayload,
   });
 
   const { clearAndRemoveSource, clearAndRemoveSources, unmanageSource } = useManagedSourceSync({
@@ -568,7 +716,7 @@ function App({ settings }: { settings: SettingsState }) {
       if (binding.category === 'sftp') {
         continue;
       }
-      const terminalActions = ['copy', 'paste', 'selectAll', 'clearBuffer', 'searchTerminal'];
+      const terminalActions = ['copy', 'paste', 'pasteSelection', 'selectAll', 'clearBuffer', 'searchTerminal'];
       if (terminalActions.includes(binding.action)) {
         if (isTerminalElement) {
           return;
@@ -873,6 +1021,10 @@ function App({ settings }: { settings: SettingsState }) {
   const addConnectionLogRef = useRef(addConnectionLog);
   addConnectionLogRef.current = addConnectionLog;
 
+  const closeSidePanelRef = useRef<(() => void) | null>(null);
+  const activeSidePanelTabRef = useRef<string | null>(null);
+  const closeTabInFlightRef = useRef(false);
+
   const createLocalTerminalWithCurrentShell = useCallback(() => {
     const resolved = resolveShellSetting(terminalSettings.localShell, discoveredShells);
     const matchedShell = discoveredShells.find(s => s.id === terminalSettings.localShell);
@@ -906,15 +1058,102 @@ function App({ settings }: { settings: SettingsState }) {
     return hotkeyScheme === 'mac' ? closeTabBinding.mac : closeTabBinding.pc;
   }, [hotkeyScheme, keyBindings]);
 
+  const confirmIfBusyLocalTerminal = useCallback(
+    async (sessionIds: string[]): Promise<boolean> => {
+      const bridge = netcattyBridge.get();
+      const localIds = sessionIds.filter((id) => {
+        const s = sessions.find((x) => x.id === id);
+        return s?.protocol === 'local';
+      });
+      const busyCommands: string[] = [];
+      for (const id of localIds) {
+        const children = (await bridge?.ptyGetChildProcesses?.(id)) ?? [];
+        if (children.length > 0) {
+          busyCommands.push(children[0].command);
+        }
+      }
+      if (busyCommands.length === 0) return true;
+
+      const primary = busyCommands[0];
+      const extraCount = busyCommands.length - 1;
+      const message =
+        extraCount > 0
+          ? t('confirm.closeBusyTerminal.messageWithMore', {
+              command: primary,
+              count: extraCount,
+            })
+          : t('confirm.closeBusyTerminal.message', { command: primary });
+
+      const ok = await bridge?.confirmCloseBusy?.({
+        command: primary,
+        title: t('confirm.closeBusyTerminal.title'),
+        message,
+        cancelLabel: t('confirm.closeBusyTerminal.cancel'),
+        closeLabel: t('confirm.closeBusyTerminal.close'),
+      });
+      return ok === true;
+    },
+    [sessions, t],
+  );
+
+  const closeTabsInFlightRef = useRef(false);
+
+  // Close many tabs at once with a single batched busy-shell confirmation.
+  // Used by the "Close all / Close others / Close to the right" context-menu
+  // actions on tabs (#748).
+  const closeTabsBatch = useCallback(
+    async (targetIds: string[]) => {
+      if (targetIds.length === 0) return;
+      if (closeTabsInFlightRef.current) return;
+
+      // Expand workspace ids into their constituent session ids so the busy
+      // probe sees every local shell that's about to be killed.
+      const sessionIdsToProbe: string[] = [];
+      for (const tabId of targetIds) {
+        const ws = workspaces.find((w) => w.id === tabId);
+        if (ws) {
+          for (const s of sessions) {
+            if (s.workspaceId === tabId) sessionIdsToProbe.push(s.id);
+          }
+        } else if (sessions.find((s) => s.id === tabId)) {
+          sessionIdsToProbe.push(tabId);
+        }
+      }
+
+      closeTabsInFlightRef.current = true;
+      try {
+        const ok = await confirmIfBusyLocalTerminal(sessionIdsToProbe);
+        if (!ok) return;
+        for (const tabId of targetIds) {
+          if (workspaces.find((w) => w.id === tabId)) {
+            closeWorkspace(tabId);
+          } else if (sessions.find((s) => s.id === tabId)) {
+            closeSession(tabId);
+          } else if (logViews.find((lv) => lv.id === tabId)) {
+            closeLogView(tabId);
+          }
+        }
+      } finally {
+        closeTabsInFlightRef.current = false;
+      }
+    },
+    [workspaces, sessions, logViews, confirmIfBusyLocalTerminal, closeWorkspace, closeSession, closeLogView],
+  );
+
   // Shared hotkey action handler - used by both global handler and terminal callback
   const executeHotkeyAction = useCallback((action: string, e: KeyboardEvent) => {
+    // Build complete tab list: vault + (sftp when visible) + sessions/workspaces.
+    // Hiding the SFTP tab must also remove it from keyboard cycling so nextTab
+    // doesn't land on a hidden tab (which would get redirected back) and so
+    // number shortcuts don't shift.
+    const allTabs = settings.showSftpTab
+      ? ['vault', 'sftp', ...orderedTabs]
+      : ['vault', ...orderedTabs];
     switch (action) {
       case 'switchToTab': {
         // Get the number key pressed (1-9)
         const num = parseInt(e.key, 10);
         if (num >= 1 && num <= 9) {
-          // Build complete tab list: vault + sftp + sessions/workspaces
-          const allTabs = ['vault', 'sftp', ...orderedTabs];
           if (num <= allTabs.length) {
             setActiveTabId(allTabs[num - 1]);
           }
@@ -922,8 +1161,6 @@ function App({ settings }: { settings: SettingsState }) {
         break;
       }
       case 'nextTab': {
-        // Build complete tab list: vault + sftp + sessions/workspaces
-        const allTabs = ['vault', 'sftp', ...orderedTabs];
         const currentId = activeTabStore.getActiveTabId();
         const currentIdx = allTabs.indexOf(currentId);
         if (currentIdx !== -1 && allTabs.length > 0) {
@@ -935,8 +1172,6 @@ function App({ settings }: { settings: SettingsState }) {
         break;
       }
       case 'prevTab': {
-        // Build complete tab list: vault + sftp + sessions/workspaces
-        const allTabs = ['vault', 'sftp', ...orderedTabs];
         const currentId = activeTabStore.getActiveTabId();
         const currentIdx = allTabs.indexOf(currentId);
         if (currentIdx !== -1 && allTabs.length > 0) {
@@ -949,18 +1184,52 @@ function App({ settings }: { settings: SettingsState }) {
       }
       case 'closeTab': {
         const currentId = activeTabStore.getActiveTabId();
-        if (currentId !== 'vault' && currentId !== 'sftp') {
-          // Find if it's a session or workspace
-          const session = sessions.find(s => s.id === currentId);
-          if (session) {
-            closeSession(currentId);
-          } else {
-            const workspace = workspaces.find(w => w.id === currentId);
-            if (workspace) {
-              closeWorkspace(currentId);
+        if (!currentId || currentId === 'vault' || currentId === 'sftp') break;
+        if (closeTabInFlightRef.current) break;
+
+        const session = sessions.find((s) => s.id === currentId) ?? null;
+        const workspace = workspaces.find((w) => w.id === currentId) ?? null;
+
+        const focusIsInsideTerminal = !!document.activeElement?.closest('[data-session-id]');
+        const activeSidePanel = activeSidePanelTabRef.current;
+
+        const intent = resolveCloseIntent({
+          activeTabId: currentId,
+          workspace: workspace ? { id: workspace.id, focusedSessionId: workspace.focusedSessionId } : null,
+          sessionForTab: session,
+          activeSidePanelTab: activeSidePanel,
+          focusIsInsideTerminal,
+        });
+
+        closeTabInFlightRef.current = true;
+        (async () => {
+          try {
+            switch (intent.kind) {
+              case 'closeTerminal':
+              case 'closeSingleTab': {
+                const ok = await confirmIfBusyLocalTerminal([intent.sessionId]);
+                if (ok) closeSession(intent.sessionId);
+                return;
+              }
+              case 'closeSidePanel': {
+                closeSidePanelRef.current?.();
+                return;
+              }
+              case 'closeWorkspace': {
+                const ids = sessions.filter((s) => s.workspaceId === intent.workspaceId).map((s) => s.id);
+                const ok = await confirmIfBusyLocalTerminal(ids);
+                if (ok) closeWorkspace(intent.workspaceId);
+                return;
+              }
+              case 'noop':
+              default:
+                return;
             }
+          } finally {
+            closeTabInFlightRef.current = false;
           }
-        }
+        })();
+
         break;
       }
       case 'newTab':
@@ -983,11 +1252,19 @@ function App({ settings }: { settings: SettingsState }) {
         setActiveTabId('vault');
         break;
       case 'openSftp':
-        setActiveTabId('sftp');
+        if (settings.showSftpTab) {
+          setActiveTabId('sftp');
+        }
         break;
       case 'quickSwitch':
       case 'commandPalette':
         setIsQuickSwitcherOpen(true);
+        break;
+      case 'newWorkspace':
+        // Dedicated shortcut to launch the AddToWorkspaceDialog in
+        // create mode — same entry as QuickSwitcher's "New Workspace"
+        // button, but without having to open QS first.
+        setAddToWorkspaceDialog({ mode: 'create' });
         break;
       case 'portForwarding':
         // Navigate to vault and open port forwarding section
@@ -1071,7 +1348,7 @@ function App({ settings }: { settings: SettingsState }) {
         break;
       }
     }
-  }, [orderedTabs, sessions, workspaces, setActiveTabId, closeSession, closeWorkspace, createLocalTerminalWithCurrentShell, splitSessionWithCurrentShell, moveFocusInWorkspace, toggleBroadcast]);
+  }, [orderedTabs, sessions, workspaces, setActiveTabId, closeSession, closeWorkspace, createLocalTerminalWithCurrentShell, splitSessionWithCurrentShell, moveFocusInWorkspace, toggleBroadcast, settings.showSftpTab, confirmIfBusyLocalTerminal]);
 
   // Callback for terminal to invoke app-level hotkey actions
   const handleHotkeyAction = useCallback((action: string, e: KeyboardEvent) => {
@@ -1380,6 +1657,19 @@ function App({ settings }: { settings: SettingsState }) {
     };
   }, [handleOpenSettings, t]);
 
+  // Delete-from-sidepanel plumbing: ScriptsSidePanel's right-click menu
+  // dispatches `netcatty:snippets:delete` with the snippet id. Handled here
+  // (rather than in QuickAddSnippetDialog) because delete needs no UI.
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const id = (e as CustomEvent<{ id?: string }>).detail?.id;
+      if (!id) return;
+      updateSnippets(snippets.filter((s) => s.id !== id));
+    };
+    window.addEventListener('netcatty:snippets:delete', handler);
+    return () => window.removeEventListener('netcatty:snippets:delete', handler);
+  }, [snippets, updateSnippets]);
+
   const handleEndSessionDrag = useCallback(() => {
     setDraggingSessionId(null);
   }, [setDraggingSessionId]);
@@ -1431,6 +1721,7 @@ function App({ settings }: { settings: SettingsState }) {
         onRenameWorkspace={startWorkspaceRename}
         onCloseWorkspace={closeWorkspace}
         onCloseLogView={closeLogView}
+        onCloseTabsBatch={closeTabsBatch}
         onOpenQuickSwitcher={handleOpenQuickSwitcher}
         onToggleTheme={handleToggleTheme}
         onOpenSettings={handleOpenSettings}
@@ -1439,6 +1730,7 @@ function App({ settings }: { settings: SettingsState }) {
         onStartSessionDrag={setDraggingSessionId}
         onEndSessionDrag={handleEndSessionDrag}
         onReorderTabs={reorderTabs}
+        showSftpTab={settings.showSftpTab}
         databaseSessions={databaseSessions}
         onCloseDatabaseSession={handleCloseDatabaseSession}
       />
@@ -1486,6 +1778,8 @@ function App({ settings }: { settings: SettingsState }) {
             onClearUnsavedConnectionLogs={clearUnsavedConnectionLogs}
             onRunSnippet={runSnippet}
             onOpenLogView={openLogView}
+            showRecentHosts={settings.showRecentHosts}
+            showOnlyUngroupedHostsInRoot={settings.showOnlyUngroupedHostsInRoot}
             onDatabaseSessionsChange={setDatabaseSessions}
             navigateToSection={navigateToSection}
             onNavigateToSectionHandled={() => setNavigateToSection(null)}
@@ -1543,6 +1837,9 @@ function App({ settings }: { settings: SettingsState }) {
           onTerminalDataCapture={handleTerminalDataCapture}
           onCreateWorkspaceFromSessions={createWorkspaceFromSessions}
           onAddSessionToWorkspace={addSessionToWorkspace}
+          onRequestAddToWorkspace={(workspaceId) =>
+            setAddToWorkspaceDialog({ mode: 'append', workspaceId })
+          }
           onUpdateSplitSizes={updateSplitSizes}
           onSetDraggingSessionId={setDraggingSessionId}
           onToggleWorkspaceViewMode={toggleWorkspaceViewMode}
@@ -1562,6 +1859,8 @@ function App({ settings }: { settings: SettingsState }) {
           sessionLogsEnabled={sessionLogsEnabled}
           sessionLogsDir={sessionLogsDir}
           sessionLogsFormat={sessionLogsFormat}
+          closeSidePanelRef={closeSidePanelRef}
+          activeSidePanelTabRef={activeSidePanelTabRef}
         />
 
         {/* Log Views - readonly terminal replays */}
@@ -1581,16 +1880,64 @@ function App({ settings }: { settings: SettingsState }) {
         })}
       </div>
 
-      {/* Global "quick add snippet" dialog, triggered by the
-          netcatty:snippets:add window event (from ScriptsSidePanel "+"). */}
+      {/* Global "quick add / edit snippet" dialog, triggered by the
+          netcatty:snippets:add and :edit window events (from ScriptsSidePanel
+          "+" button and right-click menu). Delete is handled by a sibling
+          useEffect above — it does not need a dialog. */}
       <QuickAddSnippetDialog
         snippets={snippets}
         packages={snippetPackages}
         onCreateSnippet={(snippet) => updateSnippets([...snippets, snippet])}
+        onUpdateSnippet={(snippet) =>
+          updateSnippets(snippets.map((s) => (s.id === snippet.id ? snippet : s)))
+        }
         onCreatePackage={(pkg) =>
           updateSnippetPackages(Array.from(new Set([...snippetPackages, pkg])))
         }
       />
+
+      {/* Root-mounted AddToWorkspaceDialog — triggered by the focus-mode
+          "+" button (mode='append') or QuickSwitcher's "New Workspace"
+          button (mode='create'). Single instance so dialog state and
+          styling stay consistent across entry points. */}
+      {addToWorkspaceDialog && (
+        <AddToWorkspaceDialog
+          open
+          onOpenChange={(open) => { if (!open) setAddToWorkspaceDialog(null); }}
+          // Filter serial hosts only in append mode — appendHostToWorkspace
+          // has no serial code path. Create mode goes through
+          // createWorkspaceFromTargets, which builds a SerialConfig-backed
+          // session for serial hosts, so those should remain pickable.
+          hosts={addToWorkspaceDialog.mode === 'append'
+            ? hosts.filter((h) => h.protocol !== 'serial')
+            : hosts}
+          workspaceTitle={
+            addToWorkspaceDialog.mode === 'append'
+              ? workspaces.find((w) => w.id === addToWorkspaceDialog.workspaceId)?.title
+              : 'New Workspace'
+          }
+          onAdd={(targets) => {
+            if (addToWorkspaceDialog.mode === 'append') {
+              // Match the workspace root's current split direction so
+              // the new panes peer the existing siblings instead of
+              // wrapping the whole tree into one side of a fresh split
+              // (which would happen if we always passed the helper's
+              // default 'vertical').
+              const ws = workspaces.find((w) => w.id === addToWorkspaceDialog.workspaceId);
+              const rootDir = ws && ws.root.type === 'split' ? ws.root.direction : 'vertical';
+              for (const target of targets) {
+                if (target.kind === 'local') {
+                  appendLocalTerminalToWorkspace(addToWorkspaceDialog.workspaceId, undefined, rootDir);
+                } else {
+                  appendHostToWorkspace(addToWorkspaceDialog.workspaceId, target.host, rootDir);
+                }
+              }
+            } else {
+              createWorkspaceFromTargets(targets);
+            }
+          }}
+        />
+      )}
 
       {isQuickSwitcherOpen && (
         <Suspense fallback={null}>
@@ -1600,6 +1947,7 @@ function App({ settings }: { settings: SettingsState }) {
             results={quickResults}
             sessions={sessions}
             workspaces={workspaces}
+            showSftpTab={settings.showSftpTab}
             onQueryChange={setQuickSearch}
             onSelect={handleHostConnectWithProtocolCheck}
             onSelectTab={(tabId) => {
@@ -1614,7 +1962,8 @@ function App({ settings }: { settings: SettingsState }) {
             }}
             onCreateWorkspace={() => {
               setIsQuickSwitcherOpen(false);
-              setIsCreateWorkspaceOpen(true);
+              setQuickSearch('');
+              setAddToWorkspaceDialog({ mode: 'create' });
             }}
             onClose={() => {
               setIsQuickSwitcherOpen(false);

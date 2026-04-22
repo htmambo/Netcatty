@@ -34,11 +34,138 @@ let trayMenuData = {
 let trayPanelWindow = null;
 
 let trayPanelRefreshTimer = null;
+// Watchdog: if `leave-full-screen` never arrives (edge case / stuck transition)
+// we eventually give up and force a hide attempt. Better a visible window than
+// a hung close-to-tray path.
+const FULLSCREEN_LEAVE_WATCHDOG_MS = 5000;
+// After `leave-full-screen` fires, macOS emits a trailing `show` event while
+// the native space transition finishes. Calling `win.hide()` before that show
+// causes the window to pop back on screen. We wait for the trailing show, or
+// fall back on this timeout — whichever comes first.
+const FULLSCREEN_TRAILING_SHOW_FALLBACK_MS = 300;
+const pendingFullscreenHideByWindow = new WeakMap();
+
+function clearPendingFullscreenHide(win) {
+  if (!win || typeof win !== "object") return;
+  const pending = pendingFullscreenHideByWindow.get(win);
+  if (!pending) return;
+
+  if (pending.watchdogTimer) {
+    clearTimeout(pending.watchdogTimer);
+    pending.watchdogTimer = null;
+  }
+  if (pending.trailingShowTimer) {
+    clearTimeout(pending.trailingShowTimer);
+    pending.trailingShowTimer = null;
+  }
+
+  try {
+    if (pending.onLeaveFullScreen) {
+      win.removeListener?.("leave-full-screen", pending.onLeaveFullScreen);
+    }
+    if (pending.onClosed) {
+      win.removeListener?.("closed", pending.onClosed);
+    }
+    if (pending.onTrailingShow) {
+      win.removeListener?.("show", pending.onTrailingShow);
+    }
+  } catch {
+    // ignore
+  }
+
+  pendingFullscreenHideByWindow.delete(win);
+}
+
+function performPendingFullscreenHide(win) {
+  const pending = pendingFullscreenHideByWindow.get(win);
+  if (!pending) return "cancelled";
+  if (!win || win.isDestroyed?.()) {
+    clearPendingFullscreenHide(win);
+    return "cancelled";
+  }
+
+  clearPendingFullscreenHide(win);
+
+  try {
+    win.hide();
+    return "hidden";
+  } catch (err) {
+    console.warn("[GlobalShortcut] Error hiding window after leaving fullscreen:", err);
+    return "failed";
+  }
+}
+
+function handleLeaveFullScreenForPendingHide(win) {
+  const pending = pendingFullscreenHideByWindow.get(win);
+  if (!pending) return;
+  if (!win || win.isDestroyed?.()) {
+    clearPendingFullscreenHide(win);
+    return;
+  }
+
+  pending.leaveFullScreenFired = true;
+
+  if (pending.watchdogTimer) {
+    clearTimeout(pending.watchdogTimer);
+    pending.watchdogTimer = null;
+  }
+
+  // Wait for the trailing `show` that macOS emits as the space transition
+  // finishes, then hide on top of it. If it never fires within the fallback
+  // window, hide anyway.
+  pending.onTrailingShow = () => {
+    pending.onTrailingShow = null;
+    if (pending.trailingShowTimer) {
+      clearTimeout(pending.trailingShowTimer);
+      pending.trailingShowTimer = null;
+    }
+    performPendingFullscreenHide(win);
+  };
+  try {
+    win.once?.("show", pending.onTrailingShow);
+  } catch {
+    // ignore
+  }
+
+  pending.trailingShowTimer = setTimeout(() => {
+    pending.trailingShowTimer = null;
+    if (pending.onTrailingShow) {
+      try {
+        win.removeListener?.("show", pending.onTrailingShow);
+      } catch {
+        // ignore
+      }
+      pending.onTrailingShow = null;
+    }
+    performPendingFullscreenHide(win);
+  }, FULLSCREEN_TRAILING_SHOW_FALLBACK_MS);
+}
+
+function startPendingFullscreenHideWatchdog(win) {
+  const pending = pendingFullscreenHideByWindow.get(win);
+  if (!pending) return;
+
+  pending.watchdogTimer = setTimeout(() => {
+    pending.watchdogTimer = null;
+    if (!pendingFullscreenHideByWindow.has(win)) return;
+    if (!win || win.isDestroyed?.()) {
+      clearPendingFullscreenHide(win);
+      return;
+    }
+    if (pending.leaveFullScreenFired) return;
+
+    console.warn("[GlobalShortcut] Timed out waiting for leave-full-screen before hiding to tray; forcing hide");
+    // Give up and hide anyway. Simulate the leave path so the trailing-show
+    // wait still applies (defence in depth against spurious show events).
+    handleLeaveFullScreenForPendingHide(win);
+  }, FULLSCREEN_LEAVE_WATCHDOG_MS);
+}
 
 function openMainWindow() {
   const { app } = electronModule;
   const win = getMainWindow();
   if (!win) return;
+  clearPendingFullscreenHide(win);
   if (win.isMinimized()) win.restore();
   win.show();
   win.focus();
@@ -218,6 +345,65 @@ function getMainWindow() {
   return mainWins && mainWins.length ? mainWins[0] : null;
 }
 
+function hideWindowRespectingMacFullscreen(win) {
+  if (!win || win.isDestroyed?.()) return false;
+
+  clearPendingFullscreenHide(win);
+
+  if (process.platform === "darwin" && win.isFullScreen?.()) {
+    // Close-to-tray on a native-fullscreen window on macOS has two traps:
+    //
+    // 1. `isFullScreen()` can flip to false BEFORE the exit animation
+    //    completes. Polling it and calling `win.hide()` at that moment
+    //    hides the window mid-transition, which macOS then undoes when
+    //    the animation finishes.
+    // 2. Right after the real `leave-full-screen` event, macOS emits an
+    //    internal `show` event as part of finalizing the space transition
+    //    — this show undoes any earlier hide.
+    //
+    // Strategy: wait for `leave-full-screen`, then wait for the trailing
+    // `show` that follows it (or a short timeout), and only then hide.
+    // All legitimate "bring the window back" entry points (openMainWindow,
+    // toggleWindowVisibility, setCloseToTray(false), app.on("activate"),
+    // closed) explicitly call clearPendingFullscreenHide so we never race
+    // with genuine user intent.
+    const pending = {
+      watchdogTimer: null,
+      trailingShowTimer: null,
+      leaveFullScreenFired: false,
+      onLeaveFullScreen: null,
+      onClosed: null,
+      onTrailingShow: null,
+    };
+    pending.onLeaveFullScreen = () => {
+      handleLeaveFullScreenForPendingHide(win);
+    };
+    pending.onClosed = () => {
+      clearPendingFullscreenHide(win);
+    };
+
+    try {
+      pendingFullscreenHideByWindow.set(win, pending);
+      win.once?.("leave-full-screen", pending.onLeaveFullScreen);
+      win.once?.("closed", pending.onClosed);
+      startPendingFullscreenHideWatchdog(win);
+      win.setFullScreen(false);
+      return true;
+    } catch (err) {
+      clearPendingFullscreenHide(win);
+      console.warn("[GlobalShortcut] Error leaving fullscreen before hiding window:", err);
+    }
+  }
+
+  try {
+    win.hide();
+    return true;
+  } catch (err) {
+    console.warn("[GlobalShortcut] Error hiding window:", err);
+    return false;
+  }
+}
+
 /**
  * Convert a hotkey string from frontend format to Electron accelerator format
  * e.g., "⌘ + Space" -> "CommandOrControl+Space"
@@ -283,6 +469,7 @@ function toggleWindowVisibility() {
   try {
     // Check if window is minimized first - minimized windows may still report isVisible() = true
     if (win.isMinimized()) {
+      clearPendingFullscreenHide(win);
       win.restore();
       win.show();
       win.focus();
@@ -295,9 +482,10 @@ function toggleWindowVisibility() {
     } else if (win.isVisible()) {
       if (win.isFocused()) {
         // Window is visible and focused - hide it
-        win.hide();
+        hideWindowRespectingMacFullscreen(win);
       } else {
         // Window is visible but not focused - focus it
+        clearPendingFullscreenHide(win);
         win.focus();
         const { app } = electronModule;
         try {
@@ -308,6 +496,7 @@ function toggleWindowVisibility() {
       }
     } else {
       // Window is hidden - show and focus it
+      clearPendingFullscreenHide(win);
       win.show();
       win.focus();
       const { app } = electronModule;
@@ -400,12 +589,21 @@ function createTray() {
     const resolvedIconPath = resolveTrayIconPath();
     if (resolvedIconPath) {
       trayIcon = nativeImage.createFromPath(resolvedIconPath);
-      // Resize for tray (16x16 on most platforms, 22x22 on some Linux)
       if (process.platform === "darwin") {
         trayIcon = trayIcon.resize({ width: 16, height: 16 });
         trayIcon.setTemplateImage(true);
       } else {
-        trayIcon = trayIcon.resize({ width: 16, height: 16 });
+        // Windows/Linux: attach the @2x representation so the OS can pick
+        // the right pixel size per DPI scale. Force-resizing to 16x16 here
+        // produces blurry icons on HiDPI displays where the tray slot is
+        // rendered larger than 16px.
+        const hiDpiPath = resolvedIconPath.replace(/\.png$/i, "@2x.png");
+        if (fs.existsSync(hiDpiPath)) {
+          trayIcon.addRepresentation({
+            scaleFactor: 2,
+            buffer: fs.readFileSync(hiDpiPath),
+          });
+        }
       }
     }
 
@@ -437,17 +635,7 @@ function buildTrayMenuTemplate() {
   menuTemplate.push({
     label: "Open Main Window",
     click: () => {
-      const win = getMainWindow();
-      if (win) {
-        if (win.isMinimized()) win.restore();
-        win.show();
-        win.focus();
-        try {
-          app.focus({ steal: true });
-        } catch {
-          // ignore
-        }
-      }
+      openMainWindow();
     },
   });
 
@@ -587,6 +775,7 @@ function setCloseToTray(enabled) {
       createTray();
     }
   } else {
+    clearPendingFullscreenHide(getMainWindow());
     // Destroy tray if it exists
     destroyTray();
   }
@@ -617,7 +806,7 @@ function getHotkeyStatus() {
 function handleWindowClose(event, win) {
   if (closeToTray && tray) {
     event.preventDefault();
-    win.hide();
+    hideWindowRespectingMacFullscreen(win);
     return true; // Prevented close
   }
   return false; // Allow close
@@ -727,5 +916,6 @@ module.exports = {
   init,
   registerHandlers,
   handleWindowClose,
+  clearPendingFullscreenHide,
   cleanup,
 };

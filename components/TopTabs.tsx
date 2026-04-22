@@ -13,7 +13,7 @@ import type { DatabaseSession } from '../domain/databaseModels';
 import { DISTRO_LOGOS, DISTRO_COLORS } from './DistroAvatar';
 import { getShellIconPath, isMonochromeShellIcon } from '../lib/useDiscoveredShells';
 import { Button } from './ui/button';
-import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuTrigger } from './ui/context-menu';
+import { ContextMenu, ContextMenuContent, ContextMenuItem, ContextMenuSeparator, ContextMenuTrigger } from './ui/context-menu';
 import { SyncStatusButton } from './SyncStatusButton';
 
 // Helper styles for Electron drag regions (use type assertion to include non-standard WebkitAppRegion)
@@ -37,6 +37,7 @@ interface TopTabsProps {
   onRenameWorkspace: (workspaceId: string) => void;
   onCloseWorkspace: (workspaceId: string) => void;
   onCloseLogView: (logViewId: string) => void;
+  onCloseTabsBatch: (targetIds: string[]) => void;
   onOpenQuickSwitcher: () => void;
   onToggleTheme: () => void;
   onOpenSettings: () => void;
@@ -45,7 +46,7 @@ interface TopTabsProps {
   onStartSessionDrag: (sessionId: string) => void;
   onEndSessionDrag: () => void;
   onReorderTabs: (draggedId: string, targetId: string, position: 'before' | 'after') => void;
-  // Database sessions
+  showSftpTab: boolean;
   databaseSessions?: DatabaseSession[];
   onCloseDatabaseSession?: (sessionId: string) => void;
 }
@@ -263,6 +264,7 @@ const TopTabsInner: React.FC<TopTabsProps> = ({
   onRenameWorkspace,
   onCloseWorkspace,
   onCloseLogView,
+  onCloseTabsBatch,
   onOpenQuickSwitcher,
   onToggleTheme,
   onOpenSettings,
@@ -271,6 +273,7 @@ const TopTabsInner: React.FC<TopTabsProps> = ({
   onStartSessionDrag,
   onEndSessionDrag,
   onReorderTabs,
+  showSftpTab,
   databaseSessions = [],
   onCloseDatabaseSession,
 }) => {
@@ -324,11 +327,23 @@ const TopTabsInner: React.FC<TopTabsProps> = ({
     updateScrollState();
     const container = tabsContainerRef.current;
     if (container) {
+      // Translate vertical wheel to horizontal scroll so users can reach
+      // off-screen tabs with a standard mouse wheel. Trackpad gestures that
+      // already carry horizontal delta are left alone so native two-finger
+      // swiping still works.
+      const handleWheel = (e: WheelEvent) => {
+        if (e.deltaY !== 0 && e.deltaX === 0) {
+          e.preventDefault();
+          container.scrollLeft += e.deltaY;
+        }
+      };
       container.addEventListener('scroll', updateScrollState);
+      container.addEventListener('wheel', handleWheel, { passive: false });
       const resizeObserver = new ResizeObserver(updateScrollState);
       resizeObserver.observe(container);
       return () => {
         container.removeEventListener('scroll', updateScrollState);
+        container.removeEventListener('wheel', handleWheel);
         resizeObserver.disconnect();
       };
     }
@@ -502,6 +517,37 @@ const TopTabsInner: React.FC<TopTabsProps> = ({
     }).filter(Boolean);
   }, [orderedTabs, orphanSessionMap, workspaceMap, logViewMap, workspacePaneCounts]);
 
+  // Bulk-close menu items shared by session and workspace context menus.
+  // Anchor is the tab the user right-clicked on (matches VSCode/JetBrains UX).
+  const renderBulkCloseItems = (anchorId: string) => {
+    const anchorIdx = orderedTabs.indexOf(anchorId);
+    const othersIds = orderedTabs.filter((id) => id !== anchorId);
+    const rightIds = anchorIdx >= 0 ? orderedTabs.slice(anchorIdx + 1) : [];
+    return (
+      <>
+        <ContextMenuSeparator />
+        <ContextMenuItem
+          disabled={othersIds.length === 0}
+          onClick={() => onCloseTabsBatch(othersIds)}
+        >
+          {t('tabs.closeOthers')}
+        </ContextMenuItem>
+        <ContextMenuItem
+          disabled={rightIds.length === 0}
+          onClick={() => onCloseTabsBatch(rightIds)}
+        >
+          {t('tabs.closeToRight')}
+        </ContextMenuItem>
+        <ContextMenuItem
+          className="text-destructive"
+          onClick={() => onCloseTabsBatch(orderedTabs)}
+        >
+          {t('tabs.closeAll')}
+        </ContextMenuItem>
+      </>
+    );
+  };
+
   // Render the tabs
   const renderOrderedTabs = () => {
     // Map over ordered items
@@ -521,6 +567,8 @@ const TopTabsInner: React.FC<TopTabsProps> = ({
             <ContextMenuTrigger asChild>
               <div
                 data-tab-id={session.id}
+                data-tab-type="session"
+                data-state={activeTabId === session.id ? 'active' : 'inactive'}
                 onClick={() => onSelectTab(session.id)}
                 draggable
                 onDragStart={(e) => handleTabDragStart(e, session.id)}
@@ -529,7 +577,7 @@ const TopTabsInner: React.FC<TopTabsProps> = ({
                 onDragLeave={handleTabDragLeave}
                 onDrop={(e) => handleTabDrop(e, session.id)}
                 className={cn(
-                  "relative h-7 pl-3 pr-2 min-w-[140px] max-w-[240px] rounded-none text-xs font-semibold cursor-pointer flex items-center justify-between gap-2 app-no-drag flex-shrink-0",
+                  "netcatty-tab relative h-7 pl-3 pr-2 min-w-[140px] max-w-[240px] rounded-t-md overflow-hidden text-xs font-semibold cursor-pointer flex items-center justify-between gap-2 app-no-drag flex-shrink-0",
                   "transition-transform duration-150",
                   isBeingDragged && isDraggingForReorder ? "opacity-40 scale-95" : ""
                 )}
@@ -555,13 +603,6 @@ const TopTabsInner: React.FC<TopTabsProps> = ({
                   }
                 }}
               >
-                {/* Active tab top accent line */}
-                {activeTabId === session.id && (
-                  <div
-                    className="absolute top-0 left-0 right-0 h-[2px]"
-                    style={{ backgroundColor: 'var(--top-tabs-accent, hsl(var(--accent)))' }}
-                  />
-                )}
                 {/* Drop indicator line - before */}
                 {showDropIndicatorBefore && isDraggingForReorder && (
                   <div
@@ -600,6 +641,7 @@ const TopTabsInner: React.FC<TopTabsProps> = ({
               <ContextMenuItem className="text-destructive" onClick={() => onCloseSession(session.id)}>
                 {t('common.close')}
               </ContextMenuItem>
+              {renderBulkCloseItems(session.id)}
             </ContextMenuContent>
           </ContextMenu>
         );
@@ -620,6 +662,8 @@ const TopTabsInner: React.FC<TopTabsProps> = ({
             <ContextMenuTrigger asChild>
               <div
                 data-tab-id={workspace.id}
+                data-tab-type="workspace"
+                data-state={isActive ? 'active' : 'inactive'}
                 onClick={() => onSelectTab(workspace.id)}
                 draggable
                 onDragStart={(e) => handleTabDragStart(e, workspace.id)}
@@ -628,7 +672,7 @@ const TopTabsInner: React.FC<TopTabsProps> = ({
                 onDragLeave={handleTabDragLeave}
                 onDrop={(e) => handleTabDrop(e, workspace.id)}
                 className={cn(
-                  "relative h-7 pl-3 pr-2 min-w-[150px] max-w-[260px] rounded-none text-xs font-semibold cursor-pointer flex items-center justify-between gap-2 app-no-drag flex-shrink-0",
+                  "netcatty-tab relative h-7 pl-3 pr-2 min-w-[150px] max-w-[260px] rounded-t-md overflow-hidden text-xs font-semibold cursor-pointer flex items-center justify-between gap-2 app-no-drag flex-shrink-0",
                   "transition-transform duration-150",
                   isBeingDragged && isDraggingForReorder ? "opacity-40 scale-95" : ""
                 )}
@@ -654,13 +698,6 @@ const TopTabsInner: React.FC<TopTabsProps> = ({
                   }
                 }}
               >
-                {/* Active tab top accent line */}
-                {isActive && (
-                  <div
-                    className="absolute top-0 left-0 right-0 h-[2px]"
-                    style={{ backgroundColor: 'var(--top-tabs-accent, hsl(var(--accent)))' }}
-                  />
-                )}
                 {/* Drop indicator line - before */}
                 {showDropIndicatorBefore && isDraggingForReorder && (
                   <div
@@ -704,6 +741,7 @@ const TopTabsInner: React.FC<TopTabsProps> = ({
               <ContextMenuItem className="text-destructive" onClick={() => onCloseWorkspace(workspace.id)}>
                 {t('common.close')}
               </ContextMenuItem>
+              {renderBulkCloseItems(workspace.id)}
             </ContextMenuContent>
           </ContextMenu>
         );
@@ -718,9 +756,11 @@ const TopTabsInner: React.FC<TopTabsProps> = ({
           <div
             key={logView.id}
             data-tab-id={logView.id}
+            data-tab-type="logView"
+            data-state={isActive ? 'active' : 'inactive'}
             onClick={() => onSelectTab(logView.id)}
             className={cn(
-              "relative h-7 pl-3 pr-2 min-w-[140px] max-w-[240px] rounded-none text-xs font-semibold cursor-pointer flex items-center justify-between gap-2 app-no-drag flex-shrink-0",
+              "netcatty-tab relative h-7 pl-3 pr-2 min-w-[140px] max-w-[240px] rounded-t-md overflow-hidden text-xs font-semibold cursor-pointer flex items-center justify-between gap-2 app-no-drag flex-shrink-0",
             )}
             style={{
               backgroundColor: isActive
@@ -743,13 +783,6 @@ const TopTabsInner: React.FC<TopTabsProps> = ({
               }
             }}
           >
-            {/* Active tab top accent line */}
-            {isActive && (
-              <div
-                className="absolute top-0 left-0 right-0 h-[2px]"
-                style={{ backgroundColor: 'var(--top-tabs-fg, hsl(var(--foreground)))' }}
-              />
-            )}
             <div className="flex items-center gap-2 min-w-0 flex-1">
               <FileText
                 size={14}
@@ -875,9 +908,12 @@ const TopTabsInner: React.FC<TopTabsProps> = ({
         {/* Fixed left tabs: Vaults and SFTP */}
         <div className="flex items-end gap-0 flex-shrink-0 app-drag">
           <div
+            data-tab-id="vault"
+            data-tab-type="root"
+            data-state={isVaultActive ? 'active' : 'inactive'}
             onClick={() => onSelectTab('vault')}
             className={cn(
-              "relative h-7 px-3 rounded text-xs font-semibold cursor-pointer flex items-center gap-2 app-no-drag",
+              "netcatty-tab relative h-7 px-3 rounded text-xs font-semibold cursor-pointer flex items-center gap-2 app-no-drag",
             )}
             style={{
               backgroundColor: isVaultActive
@@ -902,40 +938,39 @@ const TopTabsInner: React.FC<TopTabsProps> = ({
           >
             <FolderLock size={14} /> Vaults
           </div>
-          <div
-            onClick={() => onSelectTab('sftp')}
-            className={cn(
-              "relative h-7 px-3 rounded-none text-xs font-semibold cursor-pointer flex items-center gap-2 app-no-drag",
-            )}
-            style={{
-              backgroundColor: isSftpActive
-                ? 'var(--top-tabs-active-bg, hsl(var(--background)))'
-                : 'transparent',
-              color: isSftpActive
-                ? 'var(--top-tabs-fg, hsl(var(--foreground)))'
-                : 'var(--top-tabs-muted, hsl(var(--muted-foreground)))',
-            }}
-            onMouseEnter={(e) => {
-              if (!isSftpActive) {
-                e.currentTarget.style.backgroundColor = 'color-mix(in srgb, var(--top-tabs-active-bg, hsl(var(--background))) 40%, transparent)';
-                e.currentTarget.style.color = 'var(--top-tabs-fg, hsl(var(--foreground)))';
-              }
-            }}
-            onMouseLeave={(e) => {
-              if (!isSftpActive) {
-                e.currentTarget.style.backgroundColor = 'transparent';
-                e.currentTarget.style.color = 'var(--top-tabs-muted, hsl(var(--muted-foreground)))';
-              }
-            }}
-          >
-            {isSftpActive && (
-              <div
-                className="absolute top-0 left-0 right-0 h-[2px]"
-                style={{ backgroundColor: 'var(--top-tabs-accent, hsl(var(--accent)))' }}
-              />
-            )}
-            <Folder size={14} /> SFTP
-          </div>
+          {showSftpTab && (
+            <div
+              data-tab-id="sftp"
+              data-tab-type="root"
+              data-state={isSftpActive ? 'active' : 'inactive'}
+              onClick={() => onSelectTab('sftp')}
+              className={cn(
+                "netcatty-tab relative h-7 px-3 rounded-t-md overflow-hidden text-xs font-semibold cursor-pointer flex items-center gap-2 app-no-drag",
+              )}
+              style={{
+                backgroundColor: isSftpActive
+                  ? 'var(--top-tabs-active-bg, hsl(var(--background)))'
+                  : 'transparent',
+                color: isSftpActive
+                  ? 'var(--top-tabs-fg, hsl(var(--foreground)))'
+                  : 'var(--top-tabs-muted, hsl(var(--muted-foreground)))',
+              }}
+              onMouseEnter={(e) => {
+                if (!isSftpActive) {
+                  e.currentTarget.style.backgroundColor = 'color-mix(in srgb, var(--top-tabs-active-bg, hsl(var(--background))) 40%, transparent)';
+                  e.currentTarget.style.color = 'var(--top-tabs-fg, hsl(var(--foreground)))';
+                }
+              }}
+              onMouseLeave={(e) => {
+                if (!isSftpActive) {
+                  e.currentTarget.style.backgroundColor = 'transparent';
+                  e.currentTarget.style.color = 'var(--top-tabs-muted, hsl(var(--muted-foreground)))';
+                }
+              }}
+            >
+              <Folder size={14} /> SFTP
+            </div>
+          )}
         </div>
 
         {/* Scrollable tabs container with fade masks */}
@@ -1060,7 +1095,9 @@ const topTabsAreEqual = (prev: TopTabsProps, next: TopTabsProps): boolean => {
     prev.isImmersiveActive === next.isImmersiveActive &&
     prev.databaseSessions === next.databaseSessions &&
     prev.onToggleTheme === next.onToggleTheme &&
-    prev.followAppTerminalTheme === next.followAppTerminalTheme
+    prev.followAppTerminalTheme === next.followAppTerminalTheme &&
+    prev.showSftpTab === next.showSftpTab &&
+    prev.databaseSessions === next.databaseSessions
   );
 };
 

@@ -1,4 +1,4 @@
-import { Circle, FolderTree, LayoutGrid, MessageSquare, PanelLeft, PanelRight, Palette, Server, X, Zap } from 'lucide-react';
+import { Circle, Columns2, FolderTree, MessageSquare, PanelLeft, PanelRight, Palette, Plus, Search, Server, X, Zap } from 'lucide-react';
 import React, { createContext, memo, startTransition, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react';
 import { useActiveTabId } from '../application/state/activeTabStore';
 import {
@@ -29,10 +29,14 @@ import { cn, normalizeLineEndings } from '../lib/utils';
 import { detectLocalOs } from '../lib/localShell';
 import { useStoredString } from '../application/state/useStoredString';
 import { useStoredNumber } from '../application/state/useStoredNumber';
-import { STORAGE_KEY_SIDE_PANEL_WIDTH } from '../infrastructure/config/storageKeys';
+import {
+  STORAGE_KEY_SIDE_PANEL_WIDTH,
+  STORAGE_KEY_WORKSPACE_FOCUS_SIDEBAR_WIDTH,
+} from '../infrastructure/config/storageKeys';
 import { buildCacheKey } from '../application/state/sftp/sharedRemoteHostCache';
 import type { DropEntry } from '../lib/sftpFileUtils';
 import { GroupConfig, Host, Identity, KnownHost, SSHKey, Snippet, TerminalSession, TerminalTheme, Workspace, WorkspaceNode } from '../types';
+import type { ExecutorContext } from '../infrastructure/ai/cattyAgent/executor';
 import { resolveGroupDefaults, applyGroupDefaults } from '../domain/groupConfig';
 import { DistroAvatar } from './DistroAvatar';
 import Terminal from './Terminal';
@@ -40,11 +44,13 @@ import { SftpSidePanel } from './SftpSidePanel';
 import { ScriptsSidePanel } from './ScriptsSidePanel';
 import { ThemeSidePanel } from './terminal/ThemeSidePanel';
 import { AIChatSidePanel } from './AIChatSidePanel';
-import { cleanupOrphanedAISessions, useAIState } from '../application/state/useAIState';
+import { useAIState } from '../application/state/useAIState';
 import { TerminalComposeBar } from './terminal/TerminalComposeBar';
 import { TERMINAL_THEMES } from '../infrastructure/config/terminalThemes';
 import { useCustomThemes } from '../application/state/customThemeStore';
 import { Button } from './ui/button';
+import { Input } from './ui/input';
+import { RippleButton } from './ui/ripple';
 import { ScrollArea } from './ui/scroll-area';
 import { setupMcpApprovalBridge } from '../infrastructure/ai/shared/approvalGate';
 
@@ -259,6 +265,10 @@ interface AIChatPanelsHostProps {
   }) => ExecutorContext;
 }
 
+interface AIStateMaintenanceHostProps {
+  validAIScopeTargetIds: Set<string>;
+}
+
 const AIStateProviderInner: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const aiState = useAIState();
   return (
@@ -270,6 +280,27 @@ const AIStateProviderInner: React.FC<{ children: React.ReactNode }> = ({ childre
 
 const AIStateProvider = memo(AIStateProviderInner);
 AIStateProvider.displayName = 'AIStateProvider';
+
+const AIStateMaintenanceHostInner: React.FC<AIStateMaintenanceHostProps> = ({
+  validAIScopeTargetIds,
+}) => {
+  const aiState = useContext(AIStateContext);
+
+  if (!aiState) {
+    throw new Error('AIStateMaintenanceHost must be rendered inside AIStateProvider');
+  }
+
+  const { cleanupOrphanedSessions } = aiState;
+
+  useEffect(() => {
+    cleanupOrphanedSessions(validAIScopeTargetIds);
+  }, [cleanupOrphanedSessions, validAIScopeTargetIds]);
+
+  return null;
+};
+
+const AIStateMaintenanceHost = memo(AIStateMaintenanceHostInner);
+AIStateMaintenanceHost.displayName = 'AIStateMaintenanceHost';
 
 const AIChatPanelsHostInner: React.FC<AIChatPanelsHostProps> = ({
   mountedTabIds,
@@ -300,12 +331,20 @@ const AIChatPanelsHostInner: React.FC<AIChatPanelsHostProps> = ({
             <AIChatSidePanel
               sessions={aiState.sessions}
               activeSessionIdMap={aiState.activeSessionIdMap}
+              draftsByScope={aiState.draftsByScope}
+              panelViewByScope={aiState.panelViewByScope}
               setActiveSessionId={aiState.setActiveSessionId}
+              ensureDraftForScope={aiState.ensureDraftForScope}
+              updateDraft={aiState.updateDraft}
+              showDraftView={aiState.showDraftView}
+              showSessionView={aiState.showSessionView}
+              clearDraftForScope={aiState.clearDraftForScope}
+              addDraftFiles={aiState.addDraftFiles}
+              removeDraftFile={aiState.removeDraftFile}
               createSession={aiState.createSession}
               deleteSession={aiState.deleteSession}
               updateSessionTitle={aiState.updateSessionTitle}
               updateSessionExternalSessionId={aiState.updateSessionExternalSessionId}
-              retargetSessionScope={aiState.retargetSessionScope}
               addMessageToSession={aiState.addMessageToSession}
               updateLastMessage={aiState.updateLastMessage}
               updateMessageById={aiState.updateMessageById}
@@ -373,6 +412,7 @@ interface TerminalLayerProps {
   onTerminalDataCapture?: (sessionId: string, data: string) => void;
   onCreateWorkspaceFromSessions: (baseSessionId: string, joiningSessionId: string, hint: Exclude<SplitHint, null>) => void;
   onAddSessionToWorkspace: (workspaceId: string, sessionId: string, hint: Exclude<SplitHint, null>) => void;
+  onRequestAddToWorkspace?: (workspaceId: string) => void;
   onUpdateSplitSizes: (workspaceId: string, splitId: string, sizes: number[]) => void;
   onSetDraggingSessionId: (id: string | null) => void;
   onToggleWorkspaceViewMode?: (workspaceId: string) => void;
@@ -395,6 +435,8 @@ interface TerminalLayerProps {
   sessionLogsEnabled?: boolean;
   sessionLogsDir?: string;
   sessionLogsFormat?: string;
+  closeSidePanelRef?: React.MutableRefObject<(() => void) | null>;
+  activeSidePanelTabRef?: React.MutableRefObject<string | null>;
 }
 
 const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
@@ -429,6 +471,7 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
   onTerminalDataCapture,
   onCreateWorkspaceFromSessions,
   onAddSessionToWorkspace,
+  onRequestAddToWorkspace,
   onUpdateSplitSizes,
   onSetDraggingSessionId,
   onToggleWorkspaceViewMode,
@@ -448,6 +491,8 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
   sessionLogsEnabled,
   sessionLogsDir,
   sessionLogsFormat,
+  closeSidePanelRef,
+  activeSidePanelTabRef,
 }) => {
   // Subscribe to activeTabId from external store
   const activeTabId = useActiveTabId();
@@ -563,6 +608,8 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
   const workspaceInnerRef = useRef<HTMLDivElement>(null);
   const workspaceOverlayRef = useRef<HTMLDivElement>(null);
   const [dropHint, setDropHint] = useState<SplitHint>(null);
+  // Focus-mode sidebar: client-side filter for the terminal list.
+  const [focusSidebarSearch, setFocusSidebarSearch] = useState('');
   const [themePreview, setThemePreview] = useState<{ targetSessionId: string | null; themeId: string | null }>({
     targetSessionId: null,
     themeId: null,
@@ -617,6 +664,9 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
   const [sidePanelWidth, setSidePanelWidth, persistSidePanelWidth] = useStoredNumber(
     STORAGE_KEY_SIDE_PANEL_WIDTH, 420, { min: 280, max: 800 },
   );
+  const [focusSidebarWidth, setFocusSidebarWidth, persistFocusSidebarWidth] = useStoredNumber(
+    STORAGE_KEY_WORKSPACE_FOCUS_SIDEBAR_WIDTH, 224, { min: 160, max: 480 },
+  );
   const [sidePanelPosition, setSidePanelPosition] = useStoredString<'left' | 'right'>(
     'netcatty_side_panel_position',
     'left',
@@ -629,6 +679,9 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
   // Whether side panel is open for the currently active tab and which sub-panel
   const isSidePanelOpenForCurrentTab = activeTabId ? sidePanelOpenTabs.has(activeTabId) : false;
   const activeSidePanelTab = activeTabId ? sidePanelOpenTabs.get(activeTabId) ?? null : null;
+  if (activeSidePanelTabRef) {
+    activeSidePanelTabRef.current = activeSidePanelTab;
+  }
 
   // Legacy compatibility helpers for SFTP-specific logic
   const isSftpOpenForCurrentTab = activeSidePanelTab === 'sftp';
@@ -740,6 +793,35 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
       return next;
     });
   }, []);
+
+  // Focus-mode workspace sidebar resize handler. The sidebar is always
+  // anchored to the left of the workspace area, so a rightward drag grows it.
+  const handleFocusSidebarResizeStart = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    const startX = e.clientX;
+    const startWidth = focusSidebarWidth;
+
+    let lastWidth = startWidth;
+    let rafId: number | null = null;
+    const onMouseMove = (ev: MouseEvent) => {
+      const delta = ev.clientX - startX;
+      lastWidth = Math.max(160, Math.min(480, startWidth + delta));
+      if (rafId !== null) return;
+      rafId = requestAnimationFrame(() => {
+        rafId = null;
+        setFocusSidebarWidth(lastWidth);
+      });
+    };
+    const onMouseUp = () => {
+      if (rafId !== null) cancelAnimationFrame(rafId);
+      setFocusSidebarWidth(lastWidth);
+      persistFocusSidebarWidth(lastWidth);
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', onMouseUp);
+    };
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onMouseUp);
+  }, [focusSidebarWidth, setFocusSidebarWidth, persistFocusSidebarWidth]);
 
   // Side panel resize handler
   const handleSidePanelResizeStart = useCallback((e: React.MouseEvent) => {
@@ -853,7 +935,7 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     return map;
   }, [sessions, sessionHostsMap, hostMap, groupConfigs]);
 
-  const validTerminalTabIds = useMemo(() => {
+  const validAIScopeTargetIds = useMemo(() => {
     const ids = new Set<string>();
     for (const session of sessions) ids.add(session.id);
     for (const workspace of workspaces) ids.add(workspace.id);
@@ -941,16 +1023,12 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
   }, [workspaces]);
 
   useEffect(() => {
-    setSidePanelOpenTabs(prev => filterTabsMap(prev, validTerminalTabIds));
-    setSftpHostForTab(prev => filterTabsMap(prev, validTerminalTabIds));
-    setSftpInitialLocationForTab(prev => filterTabsMap(prev, validTerminalTabIds));
-    setSftpPendingUploadsForTab(prev => filterTabsMap(prev, validTerminalTabIds));
+    setSidePanelOpenTabs(prev => filterTabsMap(prev, validAIScopeTargetIds));
+    setSftpHostForTab(prev => filterTabsMap(prev, validAIScopeTargetIds));
+    setSftpInitialLocationForTab(prev => filterTabsMap(prev, validAIScopeTargetIds));
+    setSftpPendingUploadsForTab(prev => filterTabsMap(prev, validAIScopeTargetIds));
     sessionActivityStore.prune(validSessionActivityIds);
-  }, [validSessionActivityIds, validTerminalTabIds]);
-
-  useEffect(() => {
-    cleanupOrphanedAISessions(validTerminalTabIds);
-  }, [validTerminalTabIds]);
+  }, [validSessionActivityIds, validAIScopeTargetIds]);
 
   const computeWorkspaceRects = useCallback((workspace?: Workspace, size?: { width: number; height: number }): Record<string, WorkspaceRect> => {
     if (!workspace) return {} as Record<string, WorkspaceRect>;
@@ -1229,9 +1307,25 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
     }
   }, [activeWorkspace?.focusedSessionId, activeSession?.id, terminalBackend]);
 
+  const refocusTerminalSession = useCallback((sessionId?: string | null) => {
+    if (!sessionId) return;
+
+    const focusTarget = () => {
+      const pane = document.querySelector(`[data-session-id="${sessionId}"]`);
+      const textarea = pane?.querySelector('textarea.xterm-helper-textarea') as HTMLTextAreaElement | null;
+      textarea?.focus();
+    };
+
+    requestAnimationFrame(() => {
+      focusTarget();
+      setTimeout(focusTarget, 50);
+    });
+  }, []);
+
   // Close the entire side panel for the current tab
   const handleCloseSidePanel = useCallback(() => {
     if (!activeTabId) return;
+    const sessionIdToRefocus = activeWorkspace?.focusedSessionId ?? activeSession?.id;
     setSidePanelOpenTabs(prev => {
       const next = new Map(prev);
       next.delete(activeTabId);
@@ -1254,7 +1348,16 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
       next.delete(activeTabId);
       return next;
     });
-  }, [activeTabId]);
+    refocusTerminalSession(sessionIdToRefocus);
+  }, [activeTabId, activeWorkspace?.focusedSessionId, activeSession?.id, refocusTerminalSession]);
+
+  useEffect(() => {
+    if (!closeSidePanelRef) return;
+    closeSidePanelRef.current = handleCloseSidePanel;
+    return () => {
+      closeSidePanelRef.current = null;
+    };
+  }, [closeSidePanelRef, handleCloseSidePanel]);
 
   // Switch side panel to a specific tab (or toggle if already on that tab)
   const handleSwitchSidePanelTab = useCallback((tab: SidePanelTab) => {
@@ -1647,8 +1750,8 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
   // recomputing scope resolution from scratch on every tab switch.
   const aiContextsByTabId = useMemo(() => {
     const localOs = detectLocalOs(navigator.userAgent || navigator.platform);
-    const sessionById = new Map(sessions.map((session) => [session.id, session]));
-    const workspaceById = new Map(workspaces.map((workspace) => [workspace.id, workspace]));
+    const sessionById = new Map<string, TerminalSession>(sessions.map((session) => [session.id, session]));
+    const workspaceById = new Map<string, Workspace>(workspaces.map((workspace) => [workspace.id, workspace]));
     const tabIds = new Set<string>(mountedAiTabIds);
     if (activeTabId) tabIds.add(activeTabId);
 
@@ -1848,31 +1951,97 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
   const renderFocusModeSidebar = () => {
     if (!activeWorkspace || !isFocusMode) return null;
 
+    // Use terminal-theme colors for every surface in here so the sidebar
+    // stays readable when the app theme and terminal theme diverge
+    // (e.g. followAppTerminalTheme=off, light app + dark terminal).
+    // Tailwind's bg-foreground/* / text-foreground classes bind to app
+    // theme vars, so we derive row colors from the terminal theme
+    // directly with color-mix.
+    const termBg = resolvedPreviewTheme.colors.background;
+    const termFg = resolvedPreviewTheme.colors.foreground;
+    const selectedBg = `color-mix(in srgb, ${termFg} 10%, transparent)`;
+    const selectedHoverBg = `color-mix(in srgb, ${termFg} 15%, transparent)`;
+    const unselectedHoverBg = `color-mix(in srgb, ${termFg} 10%, transparent)`;
+    const unselectedFg = `color-mix(in srgb, ${termFg} 75%, ${termBg} 25%)`;
+    const mutedFg = `color-mix(in srgb, ${termFg} 55%, ${termBg} 45%)`;
+    const separator = `color-mix(in srgb, ${termFg} 10%, ${termBg} 90%)`;
+
     return (
       <div
-        className="w-56 flex-shrink-0 bg-secondary/50 border-r border-border/50 flex flex-col"
+        className="flex-shrink-0 flex flex-col relative"
+        style={{
+          width: focusSidebarWidth,
+          // Paint the sidebar with the terminal's theme background so it
+          // reads as one continuous surface with the focused terminal
+          // (instead of a distinct tinted panel sitting next to it).
+          backgroundColor: termBg,
+          color: termFg,
+          borderRight: `1px solid ${separator}`,
+        }}
         data-section="terminal-workspace-sidebar"
       >
-        {/* Header with view toggle */}
-        <div className="h-10 flex items-center justify-between px-3 border-b border-border/50">
-          <span className="text-xs font-medium text-muted-foreground">
-            Terminals · {workspaceSessions.length}
-          </span>
+        {/* Resize handle sitting on the right edge of the sidebar. */}
+        <div
+          className="absolute top-0 right-[-3px] h-full w-2 cursor-ew-resize z-30"
+          onMouseDown={handleFocusSidebarResizeStart}
+        />
+        {/* Header — search box + actions (matches Vault-sidebar search
+            style but skinned to the terminal theme so it blends with the
+            sidebar's bg). */}
+        <div
+          className="h-11 flex items-center gap-1.5 px-2"
+          style={{ borderBottom: `1px solid ${separator}` }}
+        >
+          <div className="relative flex-1 min-w-0">
+            <Search
+              size={12}
+              className="absolute left-1 top-1/2 -translate-y-1/2 pointer-events-none"
+              style={{ color: mutedFg }}
+            />
+            <Input
+              value={focusSidebarSearch}
+              onChange={(e) => setFocusSidebarSearch(e.target.value)}
+              placeholder="Search terminals..."
+              className="h-7 pl-6 pr-0 text-xs bg-transparent border-0 shadow-none focus-visible:ring-0 focus-visible:ring-offset-0"
+              style={{ color: termFg }}
+            />
+          </div>
+          {onRequestAddToWorkspace && (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 w-7 p-0 flex-shrink-0 hover:text-inherit"
+              style={{ color: mutedFg }}
+              onClick={() => onRequestAddToWorkspace(activeWorkspace.id)}
+              title="Add Terminal"
+            >
+              <Plus size={14} />
+            </Button>
+          )}
           <Button
             variant="ghost"
             size="sm"
-            className="h-7 w-7 p-0"
+            className="h-7 w-7 p-0 flex-shrink-0 hover:text-inherit"
+            style={{ color: mutedFg }}
             onClick={() => onToggleWorkspaceViewMode?.(activeWorkspace.id)}
             title="Switch to Split View"
           >
-            <LayoutGrid size={14} />
+            <Columns2 size={14} />
           </Button>
         </div>
 
         {/* Session list */}
         <ScrollArea className="flex-1">
           <div className="p-2 space-y-1">
-            {workspaceSessions.map(session => {
+            {workspaceSessions.filter((session) => {
+              const term = focusSidebarSearch.trim().toLowerCase();
+              if (!term) return true;
+              return (
+                session.hostLabel?.toLowerCase().includes(term)
+                || session.hostname?.toLowerCase().includes(term)
+                || session.username?.toLowerCase().includes(term)
+              );
+            }).map(session => {
               const host = sessionHostsMap.get(session.id);
               const isSelected = session.id === focusedSessionId;
               const statusColor = session.status === 'connected'
@@ -1881,35 +2050,49 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
                   ? 'text-amber-500'
                   : 'text-red-500';
 
+              const restBg = isSelected ? selectedBg : 'transparent';
+              const hoverBg = isSelected ? selectedHoverBg : unselectedHoverBg;
+              const rowFg = isSelected ? termFg : unselectedFg;
+
               return (
-                <div
+                <RippleButton
                   key={session.id}
-                  className={cn(
-                    "flex items-center gap-2 px-2 py-1.5 rounded-md cursor-pointer transition-colors",
-                    isSelected
-                      ? "bg-primary/15 border border-primary/30"
-                      : "hover:bg-secondary/80 border border-transparent"
-                  )}
+                  variant="ghost"
+                  // Row colors are terminal-theme derived (see renderFocusModeSidebar
+                  // top). `hover:text-inherit` pins text against ghost variant's
+                  // hover:text-accent-foreground default; hover bg is swapped
+                  // via inline style so we stay on terminal-theme alpha rather
+                  // than Tailwind's app-theme foreground color.
+                  className="w-full h-auto justify-start gap-2 px-2 py-1.5 font-normal hover:text-inherit"
+                  style={{ backgroundColor: restBg, color: rowFg }}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.backgroundColor = hoverBg;
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.backgroundColor = restBg;
+                  }}
                   onClick={() => onSetWorkspaceFocusedSession?.(activeWorkspace.id, session.id)}
                 >
-                  <div className="relative">
+                  <div className="relative flex-shrink-0">
                     {host ? (
                       <DistroAvatar host={host} fallback={session.hostLabel} size="sm" />
                     ) : (
-                      <Server size={16} className="text-muted-foreground" />
+                      <Server size={16} style={{ color: mutedFg }} />
                     )}
                     <Circle
                       size={6}
                       className={cn("absolute -bottom-0.5 -right-0.5 fill-current", statusColor)}
                     />
                   </div>
-                  <div className="flex-1 min-w-0">
-                    <div className="text-xs font-medium truncate">{session.hostLabel}</div>
-                    <div className="text-[10px] text-muted-foreground truncate">
+                  <div className="flex-1 min-w-0 text-left">
+                    <div className={cn("text-xs truncate", isSelected ? "font-semibold" : "font-medium")}>
+                      {session.hostLabel}
+                    </div>
+                    <div className="text-[10px] truncate" style={{ color: mutedFg }}>
                       {session.username}@{session.hostname}
                     </div>
                   </div>
-                </div>
+                </RippleButton>
               );
             })}
           </div>
@@ -1920,6 +2103,7 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
 
   return (
     <AIStateProvider>
+      <AIStateMaintenanceHost validAIScopeTargetIds={validAIScopeTargetIds} />
       <div
         ref={workspaceOuterRef}
         className="absolute inset-0 bg-background flex flex-col"
@@ -1930,14 +2114,18 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
           zIndex: isTerminalLayerVisible ? 10 : 0,
         }}
       >
-        <div className={cn("flex-1 flex min-h-0 relative", sidePanelPosition === 'right' && "flex-row-reverse")}>
-        {/* Side panel with tab header + content (SFTP / Scripts / Theme) */}
+        <div className="flex-1 flex min-h-0 relative">
+        {/* Side panel with tab header + content (SFTP / Scripts / Theme).
+            Uses `order-last` instead of flex-row-reverse on the parent so the
+            workspace focus-mode sidebar and terminal area below stay in source
+            order (sidebar on the left) regardless of the side panel's side. */}
         {(isSidePanelOpenForCurrentTab || mountedSftpTabIds.length > 0 || mountedAiTabIds.length > 0) && (
           <>
             <div
               style={{ width: isSidePanelOpenForCurrentTab ? sidePanelWidth : 0 }}
               className={cn(
                 "flex-shrink-0 h-full relative z-20",
+                sidePanelPosition === 'right' && "order-last",
               )}
             >
               {isSidePanelOpenForCurrentTab && (
@@ -1974,7 +2162,10 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
                     <Button
                       variant="ghost"
                       size="icon"
-                      className="h-7 w-7 rounded-md p-0 hover:bg-transparent"
+                      data-tab-id="sftp"
+                      data-tab-type="sidepanel"
+                      data-state={activeSidePanelTab === 'sftp' ? 'active' : 'inactive'}
+                      className="netcatty-tab h-7 w-7 rounded-md p-0 hover:bg-transparent"
                       style={{
                         color: activeSidePanelTab === 'sftp'
                           ? 'var(--terminal-sidepanel-fg)'
@@ -1988,7 +2179,10 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
                     <Button
                       variant="ghost"
                       size="icon"
-                      className="h-7 w-7 rounded-md p-0 hover:bg-transparent"
+                      data-tab-id="scripts"
+                      data-tab-type="sidepanel"
+                      data-state={activeSidePanelTab === 'scripts' ? 'active' : 'inactive'}
+                      className="netcatty-tab h-7 w-7 rounded-md p-0 hover:bg-transparent"
                       style={{
                         color: activeSidePanelTab === 'scripts'
                           ? 'var(--terminal-sidepanel-fg)'
@@ -2002,7 +2196,10 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
                     <Button
                       variant="ghost"
                       size="icon"
-                      className="h-7 w-7 rounded-md p-0 hover:bg-transparent"
+                      data-tab-id="theme"
+                      data-tab-type="sidepanel"
+                      data-state={activeSidePanelTab === 'theme' ? 'active' : 'inactive'}
+                      className="netcatty-tab h-7 w-7 rounded-md p-0 hover:bg-transparent"
                       style={{
                         color: activeSidePanelTab === 'theme'
                           ? 'var(--terminal-sidepanel-fg)'
@@ -2016,7 +2213,10 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
                     <Button
                       variant="ghost"
                       size="icon"
-                      className="h-7 w-7 rounded-md p-0 hover:bg-transparent"
+                      data-tab-id="ai"
+                      data-tab-type="sidepanel"
+                      data-state={activeSidePanelTab === 'ai' ? 'active' : 'inactive'}
+                      className="netcatty-tab h-7 w-7 rounded-md p-0 hover:bg-transparent"
                       style={{
                         color: activeSidePanelTab === 'ai'
                           ? 'var(--terminal-sidepanel-fg)'
@@ -2145,6 +2345,7 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
 
         {/* Focus mode sidebar */}
         {isFocusMode && renderFocusModeSidebar()}
+
 
         <div ref={workspaceInnerRef} className="overflow-hidden relative flex-1">
           {draggingSessionId && !isFocusMode && (
@@ -2360,14 +2561,7 @@ const TerminalLayerInner: React.FC<TerminalLayerProps> = ({
             onSend={handleComposeSend}
             onClose={() => {
               setIsComposeBarOpen(false);
-              // Refocus the terminal pane (matching solo-session behavior)
-              if (focusedSessionId) {
-                requestAnimationFrame(() => {
-                  const pane = document.querySelector(`[data-session-id="${focusedSessionId}"]`);
-                  const textarea = pane?.querySelector('textarea.xterm-helper-textarea') as HTMLTextAreaElement | null;
-                  textarea?.focus();
-                });
-              }
+              refocusTerminalSession(focusedSessionId);
             }}
             isBroadcastEnabled={isBroadcastEnabled?.(activeWorkspace.id)}
             themeColors={composeBarThemeColors}

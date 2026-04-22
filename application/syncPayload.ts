@@ -43,6 +43,8 @@ import {
   STORAGE_KEY_SFTP_GLOBAL_BOOKMARKS,
   STORAGE_KEY_CUSTOM_THEMES,
   STORAGE_KEY_SHOW_RECENT_HOSTS,
+  STORAGE_KEY_SHOW_ONLY_UNGROUPED_HOSTS_IN_ROOT,
+  STORAGE_KEY_SHOW_SFTP_TAB,
 } from '../infrastructure/config/storageKeys';
 
 // ---------------------------------------------------------------------------
@@ -59,6 +61,29 @@ export interface SyncableVaultData {
   snippetPackages?: string[];
   knownHosts: KnownHost[];
   groupConfigs?: GroupConfig[];
+}
+
+/**
+ * Returns true when the payload contains any meaningful user data worth
+ * protecting or syncing.
+ */
+export function hasMeaningfulSyncData(payload: SyncPayload): boolean {
+  const hasEntities =
+    (payload.hosts?.length ?? 0) > 0 ||
+    (payload.keys?.length ?? 0) > 0 ||
+    (payload.snippets?.length ?? 0) > 0 ||
+    (payload.identities?.length ?? 0) > 0 ||
+    (payload.customGroups?.length ?? 0) > 0 ||
+    (payload.snippetPackages?.length ?? 0) > 0 ||
+    (payload.portForwardingRules?.length ?? 0) > 0 ||
+    (payload.knownHosts?.length ?? 0) > 0 ||
+    (payload.groupConfigs?.length ?? 0) > 0;
+
+  if (hasEntities) return true;
+
+  return Boolean(
+    payload.settings && Object.values(payload.settings).some((value) => value !== undefined),
+  );
 }
 
 /** Callbacks used by `applySyncPayload` to import data into local state. */
@@ -83,7 +108,8 @@ const SYNCABLE_TERMINAL_KEYS = [
   'smoothScrolling',
   'rightClickBehavior', 'copyOnSelect', 'middleClickPaste', 'wordSeparators',
   'linkModifier', 'keywordHighlightEnabled', 'keywordHighlightRules',
-  'keepaliveInterval', 'disableBracketedPaste', 'osc52Clipboard',
+  'keepaliveInterval', 'disableBracketedPaste', 'clearWipesScrollback',
+  'preserveSelectionOnInput', 'osc52Clipboard',
   'autocompleteEnabled', 'autocompleteGhostText', 'autocompletePopupMenu',
   'autocompleteDebounceMs', 'autocompleteMinChars', 'autocompleteMaxSuggestions',
 ] as const;
@@ -173,6 +199,10 @@ export function collectSyncableSettings(): SyncPayload['settings'] {
 
   const showRecent = localStorageAdapter.readBoolean(STORAGE_KEY_SHOW_RECENT_HOSTS);
   if (showRecent != null) settings.showRecentHosts = showRecent;
+  const showOnlyUngroupedHostsInRoot = localStorageAdapter.readBoolean(STORAGE_KEY_SHOW_ONLY_UNGROUPED_HOSTS_IN_ROOT);
+  if (showOnlyUngroupedHostsInRoot != null) settings.showOnlyUngroupedHostsInRoot = showOnlyUngroupedHostsInRoot;
+  const showSftpTab = localStorageAdapter.readBoolean(STORAGE_KEY_SHOW_SFTP_TAB);
+  if (showSftpTab != null) settings.showSftpTab = showSftpTab;
 
   return Object.keys(settings).length > 0 ? settings : undefined;
 }
@@ -238,6 +268,15 @@ function applySyncableSettings(settings: NonNullable<SyncPayload['settings']>): 
 
   // Immersive mode (legacy — always enabled, ignore incoming value)
   if (settings.showRecentHosts != null) localStorageAdapter.writeBoolean(STORAGE_KEY_SHOW_RECENT_HOSTS, settings.showRecentHosts);
+  if (settings.showOnlyUngroupedHostsInRoot != null) {
+    localStorageAdapter.writeBoolean(
+      STORAGE_KEY_SHOW_ONLY_UNGROUPED_HOSTS_IN_ROOT,
+      settings.showOnlyUngroupedHostsInRoot,
+    );
+  }
+  if (settings.showSftpTab != null) {
+    localStorageAdapter.writeBoolean(STORAGE_KEY_SHOW_SFTP_TAB, settings.showSftpTab);
+  }
 }
 
 // ---------------------------------------------------------------------------

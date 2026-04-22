@@ -114,6 +114,10 @@ export type CreateXTermRuntimeContext = {
   onAutocompleteKeyEvent?: (e: KeyboardEvent) => boolean;
   // Autocomplete input handler — called on every character input
   onAutocompleteInput?: (data: string) => void;
+
+  // Set to true while we're programmatically restoring a selection so that
+  // copy-on-select listeners can suppress redundant clipboard writes.
+  isRestoringSelectionRef?: RefObject<boolean>;
 };
 
 const detectPlatform = (): XTermPlatform => {
@@ -182,7 +186,11 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
 
   const cursorStyle = settings?.cursorShape ?? "block";
   const cursorBlink = settings?.cursorBlink ?? true;
-  const scrollback = settings?.scrollback ?? 10000;
+  // xterm.js treats scrollback=0 as "no scrollback buffer", which breaks mouse
+  // wheel scrolling (events become arrow-key sequences).  The UI uses 0 to mean
+  // "no limit", so map it to a large value instead.
+  const rawScrollback = settings?.scrollback ?? 10000;
+  const scrollback = rawScrollback === 0 ? 999999 : rawScrollback;
   const drawBoldTextInBrightColors = settings?.drawBoldInBrightColors ?? true;
   const fontWeight = resolveHostTerminalFontWeight(ctx.host, settings?.fontWeight ?? 400);
   const fontWeightBold = settings?.fontWeightBold ?? 700;
@@ -415,16 +423,42 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
       return true;
     }
 
+    // Preserve mouse selection across keystrokes when enabled. xterm.js
+    // unconditionally clears the selection on user input
+    // (SelectionService.ts: coreService.onUserInput → clearSelection).
+    // Capture the selection here, then re-apply it after xterm has
+    // processed the key + cleared. The microtask runs after both
+    // synchronous listeners, so by then either the selection is gone (and
+    // we restore) or it's still there (we no-op).
+    if (
+      ctx.terminalSettingsRef.current?.preserveSelectionOnInput &&
+      term.hasSelection()
+    ) {
+      const sel = term.getSelectionPosition();
+      if (sel) {
+        const length =
+          (sel.end.y - sel.start.y) * term.cols + (sel.end.x - sel.start.x);
+        const savedStartX = sel.start.x;
+        const savedStartY = sel.start.y;
+        queueMicrotask(() => {
+          if (term.hasSelection()) return;
+          // Bail out if scrollback trim invalidated the row index.
+          if (savedStartY >= term.buffer.active.length) return;
+          const restoreFlag = ctx.isRestoringSelectionRef;
+          if (restoreFlag) restoreFlag.current = true;
+          try {
+            term.select(savedStartX, savedStartY, length);
+          } finally {
+            if (restoreFlag) restoreFlag.current = false;
+          }
+        });
+      }
+    }
+
     // Autocomplete key handler (must be checked before other handlers)
     if (ctx.onAutocompleteKeyEvent) {
       const consumed = ctx.onAutocompleteKeyEvent(e);
       if (!consumed) return false; // Event was consumed by autocomplete
-    }
-
-    if ((e.ctrlKey || e.metaKey) && e.key === "f" && e.type === "keydown") {
-      e.preventDefault();
-      ctx.setIsSearchOpen(true);
-      return false;
     }
 
     const currentScheme = ctx.hotkeySchemeRef.current;
@@ -497,6 +531,17 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
               scrollToBottomAfterPaste();
             }
           });
+          break;
+        }
+        case "pasteSelection": {
+          const selection = term.getSelection();
+          const id = ctx.sessionRef.current;
+          if (selection && id) {
+            let data = normalizeLineEndings(selection);
+            if (term.modes.bracketedPasteMode && !ctx.terminalSettingsRef.current?.disableBracketedPaste) data = wrapBracketedPaste(data);
+            ctx.terminalBackend.writeToSession(id, data);
+            scrollToBottomAfterPaste();
+          }
           break;
         }
         case "selectAll": {
@@ -655,7 +700,10 @@ export const createXTermRuntime = (ctx: CreateXTermRuntimeContext): XTermRuntime
     if (!isEraseScrollbackSequence(params)) {
       return false;
     }
-    return true;
+    // CSI 3 J — POSIX/ncurses default `clear` emits this to wipe scrollback.
+    // Honor it unless the user opts into the legacy "preserve history" behavior.
+    const wipeAllowed = ctx.terminalSettingsRef.current?.clearWipesScrollback ?? true;
+    return !wipeAllowed;
   });
 
   // Register OSC 7 handler using xterm.js parser
