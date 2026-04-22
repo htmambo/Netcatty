@@ -764,6 +764,7 @@ echo $3 >> "$FILE"`);
               ))}
             </div>
           )}
+          </div>
         </div>
 
         {/* Identities Section */}
